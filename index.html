@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5581,7 +5583,10 @@ function bc_genEmail(name,pattern){
 function bc_loadList(){const ta=document.getElementById('bc-targets');if(ta)ta.value=APP.urlList.join('\n');}
 function bc_clearLog(){if(!confirm('Clear all comment history?'))return;APP.comments=[];SS.set('rf_comments',[]);render_commenter(document.getElementById('page-commenter'));log('Comment history cleared','warn');}
 
-// ── RENDER ───────────────────────────────────────────────────────────────────
+// ─── ADVANCED MASS COMMENTER v3.0 ─────────────────────────────────────────────
+// New: No Queue/Start split. One "Execute" action. Live URL grid. AI comment gen.
+// Backend-first architecture with full diagnostics. Real-time per-URL status.
+
 function render_commenter(el){
   const templates=SS.get('rf_ctpls',CTPLS);
   const allComments=APP.comments;
@@ -5593,87 +5598,109 @@ function render_commenter(el){
   const queue=SS.get('rf_bc_queue',[]);
   const qDone=queue.filter(q=>q.done).length;
   const qTotal=queue.length;
+  const qFailed=queue.filter(q=>q.status==='failed').length;
+  const qLive=queue.filter(q=>['posted','live','pending_moderation'].includes(q.status)).length;
   const edgeFn=localStorage.getItem('rf_bc_edge_fn')||'';
+  const rwUrl=localStorage.getItem('rf_railway_url')||'';
+  const rwStatus=SS.raw('rf_bc_rw_status','unchecked'); // 'ok'|'err'|'unchecked'
+  const rwLatency=SS.raw('rf_bc_rw_latency','');
+  const isRunning=APP.running||false;
+  const schedMode=SS.raw('rf_bc_sched_mode','immediate'); // 'immediate'|'scheduled'|'rate_limited'
+  const aiEnabled=!!localStorage.getItem('rf_bc_ai_comments');
+
+  // Backend status indicator
+  const backendBadge = rwUrl
+    ? (rwStatus==='ok'
+        ? `<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(57,211,83,0.15);border:1px solid var(--green-dim);padding:2px 7px;border-radius:2px;font-size:10px;font-family:var(--mono);color:var(--green)">● Railway ${rwLatency?rwLatency+'ms':''}</span>`
+        : rwStatus==='err'
+        ? `<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(224,82,82,0.15);border:1px solid #5a1010;padding:2px 7px;border-radius:2px;font-size:10px;font-family:var(--mono);color:var(--red)">✗ Railway Error</span>`
+        : `<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(232,184,75,0.15);border:1px solid #6b5010;padding:2px 7px;border-radius:2px;font-size:10px;font-family:var(--mono);color:var(--yellow)">◌ Railway (unverified)</span>`)
+    : edgeFn
+    ? `<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(74,158,222,0.15);border:1px solid #1a3a5a;padding:2px 7px;border-radius:2px;font-size:10px;font-family:var(--mono);color:var(--blue)">◌ Edge Fn</span>`
+    : `<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(100,100,100,0.15);border:1px solid #3a3a3a;padding:2px 7px;border-radius:2px;font-size:10px;font-family:var(--mono);color:var(--text3)">⚡ Proxy Chain</span>`;
 
   el.innerHTML=`
-  <!-- Mass Backlink Commenter Header -->
-  <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:8px 10px;background:linear-gradient(90deg,rgba(57,211,83,0.07),transparent);border:1px solid var(--win-border);border-radius:2px">
+  <!-- ■ HEADER ■ -->
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:8px 10px;background:linear-gradient(90deg,rgba(57,211,83,0.07),transparent);border:1px solid var(--win-border);border-radius:2px">
     <span style="font-size:13px;font-weight:700;color:var(--green)">💬 Mass Blog Commenter</span>
-    <span style="font-size:10px;color:var(--text3)">— Post backlink comments to any blog, WordPress or non-WP, at scale</span>
-    <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+    <span style="font-size:10px;color:var(--text3)">v3.0 — Backend-first · Live grid · AI comment gen</span>
+    ${backendBadge}
+    <button class="tbtn" style="padding:2px 7px;font-size:10px" onclick="bc_testBackend()">⚡ Test</button>
+    <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
       <span class="badge bg">${posted} posted</span>
       <span class="badge br">${failed} failed</span>
       <span class="badge by">${pending} pending</span>
       <span class="badge bg" style="background:rgba(57,211,83,0.2)">${approved} live</span>
-      ${qTotal?`<span class="badge bgray">${qDone}/${qTotal} queue</span>`:''}
+      ${qTotal?`<span class="badge bgray">${qDone}/${qTotal}</span>`:''}
     </div>
   </div>
 
+  <!-- ■ TABS ■ -->
   <div style="display:flex;gap:0;border-bottom:2px solid var(--win-border);margin-bottom:10px">
-    ${[['config','⚙ Config'],['queue','📋 Queue ('+qTotal+')'],['monitor','📡 Monitor'],['templates','✍ Templates'],['xmlrpc','🔧 XML-RPC / Proxy']].map(([id,label])=>`
+    ${[['config','⚙ Config'],['live','⚡ Live Grid ('+qTotal+')'],['monitor','📡 Monitor'],['ai','🤖 AI Comments'],['templates','✍ Templates'],['xmlrpc','🔧 Diagnostics']].map(([id,label])=>`
     <div onclick="SS.rawSet('rf_commenter_tab','${id}');render_commenter(document.getElementById('page-commenter'))"
-      style="padding:5px 14px;font-size:11px;font-weight:700;cursor:pointer;border-bottom:2px solid ${activeTab===id?'var(--green)':'transparent'};margin-bottom:-2px;color:${activeTab===id?'var(--green)':'var(--text3)'};background:${activeTab===id?'rgba(57,211,83,0.05)':'transparent'}">${label}</div>`).join('')}
+      style="padding:5px 14px;font-size:11px;font-weight:700;cursor:pointer;border-bottom:2px solid ${activeTab===id?'var(--green)':'transparent'};margin-bottom:-2px;color:${activeTab===id?'var(--green)':'var(--text3)'};background:${activeTab===id?'rgba(57,211,83,0.05)':'transparent'};white-space:nowrap">${label}</div>`).join('')}
   </div>
 
-  <!-- ═══ CONFIG TAB ═══ -->
+  <!-- ■ CONFIG TAB ■ -->
   <div style="display:${activeTab==='config'?'block':'none'}">
     <div class="g2">
       <div>
+        <!-- Target Settings -->
         <div class="panel">
-          <div class="panel-head">🎯 Backlink Target & Comment Settings</div>
+          <div class="panel-head">🎯 Backlink Target</div>
           <div class="panel-body">
             <div class="g2">
-              <div class="fg"><label class="lbl">💰 Money URL <span style="color:var(--text3);font-weight:normal">(your site getting the backlinks)</span></label>
-                <input type="url" id="bc-url" placeholder="https://yoursite.com" value="${esc(SS.raw('rf_bc_moneyurl'))||''}" oninput="SS.rawSet('rf_bc_moneyurl',this.value)"/></div>
-              <div class="fg"><label class="lbl">🔗 Website Field URL <span style="color:var(--text3);font-weight:normal">(in comment author box, usually same)</span></label>
-                <input type="url" id="bc-website" placeholder="https://yoursite.com" value="${esc(SS.raw('rf_bc_website'))||''}" oninput="SS.rawSet('rf_bc_website',this.value)"/></div>
+              <div class="fg"><label class="lbl">💰 Money URL <span style="color:var(--text3);font-weight:normal">(your site)</span></label>
+                <input type="url" id="bc-url" placeholder="https://yoursite.com" value="${esc(SS.raw('rf_bc_moneyurl'))}" oninput="SS.rawSet('rf_bc_moneyurl',this.value)"/></div>
+              <div class="fg"><label class="lbl">🔗 Website Field URL <span style="color:var(--text3);font-weight:normal">(comment author box)</span></label>
+                <input type="url" id="bc-website" placeholder="https://yoursite.com" value="${esc(SS.raw('rf_bc_website'))}" oninput="SS.rawSet('rf_bc_website',this.value)"/></div>
             </div>
-
             <div class="fg" style="margin-top:6px">
-              <label class="lbl">🔑 Anchor Keywords <span style="color:var(--text3);font-weight:normal">(one per line — rotated per comment for variety)</span></label>
+              <label class="lbl">🔑 Anchor Keywords <span style="color:var(--text3);font-weight:normal">(one per line — rotated)</span></label>
               <textarea id="bc-kw" rows="3" placeholder="best VPN 2025&#10;top VPN service&#10;VPN review" oninput="SS.set('rf_bc_kws',this.value.split('\\n').filter(Boolean))">${(SS.get('rf_bc_kws',[])||[]).join('\\n')||SS.raw('rf_bc_kw')||''}</textarea>
             </div>
-
             <div class="fg" style="margin-top:6px">
-              <label class="lbl">📋 Target URLs <span style="color:var(--text3);font-weight:normal">(paste blog post URLs, one per line — unlimited)</span></label>
-              <textarea id="bc-targets" rows="8" placeholder="https://example.com/blog-post-1&#10;https://anotherblog.com/article&#10;https://wordpress-site.com/post&#10;...">${APP.urlList.slice(0,5000).join('\\n')}</textarea>
-              <div style="display:flex;gap:6px;margin-top:4px;align-items:center;flex-wrap:wrap">
-                <button class="tbtn" onclick="bc_loadList()">📋 Load URL List (${APP.urlList.length})</button>
-                <button class="tbtn" onclick="bc_pasteFromClipboard()">📌 Paste from Clipboard</button>
-                <button class="tbtn" onclick="bc_importTxt()">📂 Import TXT file</button>
+              <label class="lbl">📋 Target URLs <span style="color:var(--text3);font-weight:normal">(one per line)</span></label>
+              <textarea id="bc-targets" rows="10" placeholder="https://example.com/blog-post-1&#10;https://anotherblog.com/article&#10;...">${APP.urlList.slice(0,5000).join('\\n')}</textarea>
+              <div style="display:flex;gap:5px;margin-top:4px;align-items:center;flex-wrap:wrap">
+                <button class="tbtn" onclick="bc_loadList()">📋 Load List (${APP.urlList.length})</button>
+                <button class="tbtn" onclick="bc_pasteFromClipboard()">📌 Clipboard</button>
+                <button class="tbtn" onclick="bc_importTxt()">📂 Import TXT</button>
+                <button class="tbtn" onclick="bc_dedupeTargets()">🔀 Dedupe</button>
                 <span id="bc-url-count" class="mono xs tm" style="color:var(--text3)"></span>
-                <button class="tbtn" style="margin-left:auto" onclick="bc_dedupeTargets()">🔀 Dedupe URLs</button>
               </div>
             </div>
           </div>
         </div>
 
+        <!-- Posting Engine Options -->
         <div class="panel" style="margin-top:8px">
-          <div class="panel-head">⚙ Posting Options</div>
+          <div class="panel-head">⚙ Posting Engine</div>
           <div class="panel-body">
             <div class="g3">
               <div class="fg"><label class="lbl">Post Method</label>
                 <select id="bc-method">
-                  <option value="auto">Auto (XML-RPC → Form fallback)</option>
-                  <option value="form">Form POST only</option>
-                  <option value="xmlrpc">XML-RPC only (WP)</option>
-                  <option value="detect">Detect Only (dry run)</option>
+                  <option value="auto">Auto (Railway → XML-RPC → Form)</option>
+                  <option value="railway_only">Railway Only</option>
+                  <option value="xmlrpc">XML-RPC Only (WP)</option>
+                  <option value="form">Form POST Only</option>
+                  <option value="detect">Detect Only (no post)</option>
                 </select></div>
               <div class="fg"><label class="lbl">Comment Style</label>
                 <select id="bc-style"><option value="mixed">Mixed (recommended)</option><option value="natural">Natural</option><option value="expert">Expert</option><option value="question">Question</option><option value="compliment">Compliment</option></select></div>
               <div class="fg"><label class="lbl">Commenter Name</label>
-                <input type="text" id="bc-name" placeholder="Random from list if blank"/></div>
+                <input type="text" id="bc-name" placeholder="Random if blank"/></div>
             </div>
-            <div class="g3">
+            <div class="g3" style="margin-top:6px">
               <div class="fg"><label class="lbl">Delay Between Posts (ms)</label>
                 <input type="number" id="bc-delay" value="${SS.raw('rf_bc_delay')||'3000'}" min="500" oninput="SS.rawSet('rf_bc_delay',this.value)"/></div>
-              <div class="fg"><label class="lbl">Human Timing Variance</label>
-                <select id="bc-variance"><option value="yes">Yes (±35% + jitter)</option><option value="no">No (fixed)</option></select></div>
-              <div class="fg"><label class="lbl">Max Comments per Domain</label>
-                <input type="number" id="bc-maxperdomain" value="${SS.raw('rf_bc_maxperdomain')||'3'}" min="1" max="50" oninput="SS.rawSet('rf_bc_maxperdomain',this.value)"
-                  title="Limits how many comments get posted to same root domain. Prevents over-concentration."/></div>
+              <div class="fg"><label class="lbl">Human Timing Jitter</label>
+                <select id="bc-variance"><option value="yes">Yes (±35% + noise)</option><option value="no">No (fixed)</option></select></div>
+              <div class="fg"><label class="lbl">Max per Domain</label>
+                <input type="number" id="bc-maxperdomain" value="${SS.raw('rf_bc_maxperdomain')||'3'}" min="1" max="50" oninput="SS.rawSet('rf_bc_maxperdomain',this.value)"/></div>
             </div>
-            <div class="g3">
+            <div class="g3" style="margin-top:6px">
               <div class="fg"><label class="lbl">Email Pattern</label>
                 <select id="bc-email">
                   <option value="firstlast99">firstlast99@domain.com</option>
@@ -5685,39 +5712,65 @@ function render_commenter(el){
               <div class="fg"><label class="lbl">Use Proxies</label>
                 <select id="bc-proxy"><option value="yes">Yes (${APP.proxies.filter(p=>p.status==='live').length} live)</option><option value="no">No</option></select></div>
             </div>
-            <div class="fg">
-              <label class="lbl">Batch Size <span style="color:var(--text3);font-weight:normal">(URLs per run — resume supported, 0 = all)</span></label>
-              <input type="number" id="bc-batchsize" value="${SS.raw('rf_bc_batchsize')||'0'}" min="0" oninput="SS.rawSet('rf_bc_batchsize',this.value)"/>
+            <div class="g2" style="margin-top:6px">
+              <div class="fg"><label class="lbl">Threads (concurrent)</label>
+                <input type="number" id="bc-threads" value="${SS.raw('rf_bc_threads')||'3'}" min="1" max="10" oninput="SS.rawSet('rf_bc_threads',this.value)" title="How many URLs to process simultaneously. Higher = faster but more detectable."/></div>
+              <div class="fg"><label class="lbl">Batch Limit (0 = all)</label>
+                <input type="number" id="bc-batchsize" value="${SS.raw('rf_bc_batchsize')||'0'}" min="0" oninput="SS.rawSet('rf_bc_batchsize',this.value)"/></div>
             </div>
           </div>
         </div>
 
-        <div class="notice ni-b" style="margin-top:8px">
-          <strong style="color:var(--green)">How it works:</strong> Detects CMS (WP/Generic/Blogger/Ghost/Disqus) → XML-RPC first on WordPress (bypasses nonce issues) → Form POST fallback for any CMS → posts through corsproxy.io → allorigins → crossorigin.me proxy chain → tracks every result with resume support.
-        </div>
-
-        <div class="flex g6 mt8" style="flex-wrap:wrap">
-          <button class="tbtn go" onclick="bc_buildQueueAndStart()">▶ Build Queue &amp; Start</button>
-          <button class="tbtn go" style="background:linear-gradient(180deg,#1a5a7a,#0e3a5a);border-color:#0e3a5a;color:#7dddff" onclick="bc_resumeQueue()">⏩ Resume Queue</button>
-          <button class="tbtn stop" onclick="APP.stopFlag=true;setStatus('Stopping...')">■ Stop</button>
-          <button class="tbtn" onclick="bc_preview()">👁 Preview Comments</button>
-          <button class="tbtn" onclick="bc_export()">📥 Export CSV</button>
-          <button class="tbtn stop" onclick="bc_clearLog()">🗑 Clear Results</button>
-          <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
-            <div class="prog-wrap" style="width:160px"><div class="prog-fill" id="bc-prog"></div></div>
-            <span id="bc-prog-label" class="mono xs tm" style="color:var(--text3)"></span>
-          </div>
-        </div>
-
-        <div id="bc-preview-panel" style="display:none;margin-top:8px" class="panel">
-          <div class="panel-head">👁 Comment Previews</div>
-          <div class="panel-body" id="bc-preview-body"></div>
+        <!-- How it works notice -->
+        <div class="notice ni-b" style="margin-top:8px;font-size:10px;line-height:1.8">
+          <strong style="color:var(--green)">Posting order:</strong>
+          ${rwUrl?`<span style="color:var(--green)">1. Railway</span> (server-side, full cookie/session) →`:'<span style="color:var(--text3)">Railway not set →</span>'}
+          ${edgeFn?`<span style="color:var(--blue)">2. Edge Fn</span> →`:''} 
+          <span style="color:var(--yellow)">XML-RPC</span> (WP only, bypasses nonce) → <span style="color:var(--text2)">Form POST</span> via proxy chain.
+          ${!rwUrl&&!edgeFn?`<span style="color:var(--yellow)"> ⚠ No backend configured — proxy chain only (lower success rate). Configure Railway in Settings for best results.</span>`:''}
         </div>
       </div>
 
+      <!-- Right column: Stats + Quick Actions -->
       <div>
-        <div class="panel">
-          <div class="panel-head">📊 Stats</div>
+        <!-- Execute Control Box -->
+        <div class="panel" style="border-color:${isRunning?'var(--green)':'var(--win-border)'};${isRunning?'box-shadow:0 0 8px rgba(57,211,83,0.2)':''}">
+          <div class="panel-head" style="background:${isRunning?'linear-gradient(90deg,rgba(57,211,83,0.15),transparent)':''}">
+            ${isRunning?'<span style="animation:pdot 1s infinite;display:inline-block">▶</span> RUNNING':'▶ Execute'}
+            <div class="ph-r">
+              ${isRunning
+                ?`<button class="tbtn stop" onclick="APP.stopFlag=true;setStatus('Stopping...')">■ Stop</button>`
+                :`<button class="tbtn go" onclick="bc_execute()" style="padding:3px 14px;font-weight:700">▶ Run Commenter</button>`
+              }
+            </div>
+          </div>
+          <div class="panel-body">
+            ${qTotal?`
+            <div style="margin-bottom:8px">
+              <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+                <span class="mono xs tm" style="color:var(--text3)">PROGRESS</span>
+                <span class="mono xs tm" style="color:var(--text2)">${qDone}/${qTotal}</span>
+              </div>
+              <div id="bc-prog-wrap" style="height:12px;background:var(--win-panel2);border:1px solid var(--win-border2);border-radius:2px;overflow:hidden">
+                <div id="bc-prog" style="height:100%;width:${qTotal?Math.round(qDone/qTotal*100):0}%;background:linear-gradient(90deg,var(--green-dim),var(--green));transition:width .4s"></div>
+              </div>
+              <div style="display:flex;gap:6px;margin-top:4px">
+                <span class="badge bg" style="font-size:9px">${qLive} posted</span>
+                <span class="badge br" style="font-size:9px">${qFailed} failed</span>
+                <span class="badge by" style="font-size:9px">${qTotal-qDone} remaining</span>
+              </div>
+            </div>`:`<div style="font-size:10px;color:var(--text3);margin-bottom:8px">No active run. Paste URLs in Config and click Run.</div>`}
+            <div style="display:flex;flex-direction:column;gap:4px">
+              <button class="tbtn" onclick="bc_resumeQueue()" style="width:100%;justify-content:center">⏩ Resume Remaining (${qTotal-qDone})</button>
+              <button class="tbtn" onclick="bc_retryFailed()" style="width:100%;justify-content:center">🔄 Retry Failed (${qFailed})</button>
+              <button class="tbtn" onclick="bc_preview()" style="width:100%;justify-content:center">👁 Preview Comments</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Stats box -->
+        <div class="panel" style="margin-top:8px">
+          <div class="panel-head">📊 Session Stats</div>
           <div class="panel-body">
             <div class="g2" style="margin-bottom:8px">
               <div class="stat"><div class="stat-v sv-g">${posted}</div><div class="stat-l">Submitted</div></div>
@@ -5725,85 +5778,86 @@ function render_commenter(el){
               <div class="stat"><div class="stat-v sv-y">${pending}</div><div class="stat-l">Pending Mod</div></div>
               <div class="stat"><div class="stat-v sv-b">${approved}</div><div class="stat-l">Confirmed Live</div></div>
             </div>
-            ${qTotal?`<div style="margin-bottom:8px">
-              <div class="mono xs tm" style="margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em">Queue Progress</div>
-              <div style="height:10px;background:var(--win-panel2);border:1px solid var(--win-border2);border-radius:2px;overflow:hidden;margin-bottom:4px">
-                <div style="height:100%;width:${qTotal?Math.round(qDone/qTotal*100):0}%;background:linear-gradient(90deg,var(--green-dim),var(--green))"></div>
-              </div>
-              <div class="mono xs tm" style="color:var(--text3)">${qDone}/${qTotal} done · ${qTotal-qDone} remaining</div>
-            </div>`:''}
             <div class="mono xs tm" style="margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em">By Method</div>
-            ${['xmlrpc','form_post','detect','failed'].map(m=>{const n=allComments.filter(c=>c.method===m).length;return n?`<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;padding:2px 0;border-bottom:1px solid var(--win-border)"><span style="color:var(--text2)">${m.replace('_',' ')}</span><span class="badge bgray">${n}</span></div>`:''}).join('')}
+            ${['railway','xmlrpc','form_post','detect','failed'].map(m=>{const n=allComments.filter(c=>c.method===m).length;return n?`<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;padding:2px 0;border-bottom:1px solid var(--win-border)"><span style="color:var(--text2)">${m.replace('_',' ')}</span><span class="badge bgray">${n}</span></div>`:''}).join('')}
             <div class="mono xs tm" style="margin:8px 0 4px;text-transform:uppercase;letter-spacing:.04em">By CMS</div>
             ${['wordpress','blogger','ghost','disqus','generic','unknown'].map(cms=>{const n=allComments.filter(c=>c.cms===cms).length;return n?`<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;padding:2px 0;border-bottom:1px solid var(--win-border)"><span style="color:var(--text2)">${cms}</span><span class="badge ${cms==='wordpress'?'bg':'bgray'}">${n}</span></div>`:''}).join('')}
+            <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">
+              <button class="tbtn" onclick="bc_export()" style="font-size:9px;padding:1px 6px">📥 Export CSV</button>
+              <button class="tbtn stop" onclick="bc_clearLog()" style="font-size:9px;padding:1px 6px">🗑 Clear</button>
+            </div>
           </div>
         </div>
-        <div class="panel" style="margin-top:8px">
-          <div class="panel-head">Recent Activity
-            <div class="ph-r"><button class="tbtn" style="padding:1px 6px;font-size:9px" onclick="bc_clearLog()">Clear</button></div>
-          </div>
-          <div style="padding:0;max-height:320px;overflow-y:auto">
-            ${allComments.length?allComments.slice(-30).reverse().map(c=>`
-              <div style="padding:5px 8px;border-bottom:1px solid #1a1a1a;display:flex;align-items:flex-start;gap:8px">
-                <span class="badge ${['posted','live','pending_moderation'].includes(c.status)?'bg':c.status==='failed'?'br':'by'}" style="flex-shrink:0;margin-top:1px;font-size:8px">${c.status}</span>
-                <div style="flex:1;min-width:0">
-                  <div class="mono xs" style="color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.target.replace(/https?:\/\//,'').slice(0,45))}</div>
-                  <div style="font-size:9px;color:var(--text3);margin-top:1px">${esc(c.name)} · ${c.cms||'?'} · ${c.method||'?'} · ${c.reason||''}${c.approvalStatus==='approved'?' · <span style="color:var(--green)">✓ LIVE</span>':''}</div>
-                </div>
-              </div>`).join('')
-            :'<div style="padding:12px;font-family:var(--mono);font-size:10px;color:var(--text3)">No comments yet.</div>'}
-          </div>
+
+        <!-- Preview panel -->
+        <div id="bc-preview-panel" style="display:none;margin-top:8px" class="panel">
+          <div class="panel-head">👁 Comment Previews</div>
+          <div class="panel-body" id="bc-preview-body"></div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- ═══ QUEUE TAB ═══ -->
-  <div style="display:${activeTab==='queue'?'block':'none'}">
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
-      <span style="font-size:11px;color:var(--text2)">${qTotal} URLs in queue · ${qDone} done · ${qTotal-qDone} remaining</span>
-      <button class="tbtn go" style="padding:2px 8px;font-size:10px" onclick="bc_resumeQueue()">⏩ Resume</button>
+  <!-- ■ LIVE GRID TAB ■ -->
+  <div style="display:${activeTab==='live'?'block':'none'}">
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+      <span style="font-size:11px;color:var(--text2)">${qTotal} URLs · ${qDone} done · ${qTotal-qDone} remaining · ${qFailed} failed · ${qLive} posted</span>
+      <button class="tbtn go" style="padding:2px 8px;font-size:10px" onclick="bc_execute()">▶ Run</button>
+      <button class="tbtn" style="padding:2px 8px;font-size:10px" onclick="bc_resumeQueue()">⏩ Resume</button>
       <button class="tbtn stop" style="padding:2px 8px;font-size:10px" onclick="APP.stopFlag=true">■ Stop</button>
-      <button class="tbtn" style="padding:2px 8px;font-size:10px" onclick="bc_clearQueue()">🗑 Clear Queue</button>
       <button class="tbtn" style="padding:2px 8px;font-size:10px" onclick="bc_retryFailed()">🔄 Retry Failed</button>
-      <button class="tbtn" style="padding:2px 8px;font-size:10px;margin-left:auto" onclick="bc_exportQueue()">📥 Export Queue Status</button>
+      <button class="tbtn stop" style="padding:2px 8px;font-size:10px" onclick="bc_clearQueue()">🗑 Clear Queue</button>
+      <button class="tbtn" style="padding:2px 8px;font-size:10px;margin-left:auto" onclick="bc_exportQueue()">📥 Export</button>
     </div>
     ${qTotal?`
-    <div class="panel">
-      <div class="panel-head">Queue Status <span class="badge bg">${qDone} done</span> <span class="badge br">${queue.filter(q=>q.status==='failed').length} failed</span> <span class="badge by">${queue.filter(q=>!q.done).length} pending</span></div>
-      <div class="panel-body" style="padding:0">
-        <div class="tbl-wrap" style="max-height:500px;overflow-y:auto"><table>
-          <thead><tr><th>#</th><th>URL</th><th>CMS</th><th>Method</th><th>Status</th><th>Reason</th></tr></thead>
-          <tbody>
-            ${queue.slice(0,500).map((q,i)=>`<tr style="opacity:${q.done?0.6:1}">
-              <td class="mono xs tm">${i+1}</td>
-              <td class="mono xs" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(q.url)}"><a href="${esc(q.url)}" target="_blank">${esc(q.url.replace(/https?:\/\//,'').slice(0,50))}</a></td>
-              <td><span class="badge ${(q.cms||'?')==='wordpress'?'bg':'bgray'}">${q.cms||'—'}</span></td>
-              <td><span class="badge bgray">${q.method||'—'}</span></td>
-              <td><span class="badge ${q.status==='posted'||q.status==='live'||q.status==='pending_moderation'?'bg':q.status==='failed'?'br':q.done?'bgray':'by'}">${q.status||'queued'}</span></td>
-              <td class="xs tm">${esc(q.reason||'—')}</td>
-            </tr>`).join('')}
-            ${qTotal>500?`<tr><td colspan="6" style="text-align:center;font-size:10px;color:var(--text3);padding:8px">... ${qTotal-500} more rows not shown</td></tr>`:''}
-          </tbody>
-        </table></div>
+    <!-- Live status progress bar -->
+    <div style="margin-bottom:8px">
+      <div style="height:8px;background:var(--win-panel2);border:1px solid var(--win-border2);border-radius:2px;overflow:hidden;display:flex">
+        <div style="height:100%;width:${qTotal?Math.round(qLive/qTotal*100):0}%;background:var(--green);transition:width .4s"></div>
+        <div style="height:100%;width:${qTotal?Math.round(qFailed/qTotal*100):0}%;background:var(--red);transition:width .4s"></div>
+        <div style="height:100%;width:${qTotal?Math.round((qDone-qLive-qFailed)/qTotal*100):0}%;background:var(--text3);transition:width .4s"></div>
       </div>
-    </div>`:`<div class="notice ni-b" style="text-align:center;padding:20px">
-      <div style="font-size:13px;margin-bottom:6px">No queue built yet</div>
-      <div style="font-size:11px;color:var(--text3)">Go to Config tab, paste your target URLs, and click <strong>Build Queue &amp; Start</strong>.</div>
+    </div>
+    <div class="panel"><div class="panel-head">Live URL Status
+      <span class="badge bg">${qLive} posted</span>
+      <span class="badge br">${qFailed} failed</span>
+      <span class="badge by">${queue.filter(q=>!q.done).length} pending</span>
+    </div>
+    <div class="panel-body" style="padding:0">
+      <div class="tbl-wrap" style="max-height:60vh;overflow-y:auto"><table>
+        <thead><tr><th>#</th><th>URL</th><th>CMS</th><th>Method Used</th><th>Status</th><th>Reason</th><th>Comment (truncated)</th></tr></thead>
+        <tbody id="bc-live-tbody">
+          ${queue.slice(0,1000).map((q,i)=>`<tr style="opacity:${q.done&&q.status!=='posted'&&q.status!=='live'&&q.status!=='pending_moderation'?0.55:1}">
+            <td class="mono xs tm">${i+1}</td>
+            <td class="mono xs" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(q.url)}"><a href="${esc(q.url)}" target="_blank">${esc(q.url.replace(/https?:\/\//,'').slice(0,50))}</a></td>
+            <td><span class="badge ${(q.cms||'?')==='wordpress'?'bg':(q.cms||'?')==='blogger'?'by':'bgray'}" style="font-size:8px">${q.cms||'—'}</span></td>
+            <td><span class="badge ${q.method==='railway'?'bg':q.method==='xmlrpc'?'bb':q.method==='form_post'?'bp':'bgray'}" style="font-size:8px">${q.method||'—'}</span></td>
+            <td><span class="badge ${['posted','live','pending_moderation'].includes(q.status)?'bg':q.status==='failed'?'br':q.done?'bgray':'by'}" style="font-size:8px">${q.status||'queued'}</span></td>
+            <td class="xs tm" style="max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(q.reason||'—')}</td>
+            <td class="xs tm" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text3)" title="${esc(q.comment||'')}">${esc((q.comment||'').slice(0,60))}${(q.comment||'').length>60?'…':''}</td>
+          </tr>`).join('')}
+          ${qTotal>1000?`<tr><td colspan="7" style="text-align:center;font-size:10px;color:var(--text3);padding:8px">... ${qTotal-1000} more rows not shown</td></tr>`:''}
+        </tbody>
+      </table></div>
+    </div></div>`
+    :`<div class="notice ni-b" style="text-align:center;padding:24px">
+      <div style="font-size:13px;margin-bottom:6px">No active run yet</div>
+      <div style="font-size:11px;color:var(--text3)">Go to Config tab, paste your target URLs, and click <strong>▶ Run Commenter</strong>.</div>
+      <div style="margin-top:12px"><button class="tbtn go" onclick="SS.rawSet('rf_commenter_tab','config');render_commenter(document.getElementById('page-commenter'))">→ Open Config</button></div>
     </div>`}
   </div>
 
-  <!-- ═══ MONITOR TAB ═══ -->
+  <!-- ■ MONITOR TAB ■ -->
   <div style="display:${activeTab==='monitor'?'block':'none'}">
     <div class="panel">
       <div class="panel-head">📡 Approval Monitor
         <div class="ph-r">
           <button class="tbtn go" style="padding:2px 9px;font-size:10px" onclick="bc_checkAllApprovals()">🔄 Re-Check All Pending</button>
-          <button class="tbtn" style="padding:2px 9px;font-size:10px" onclick="bc_export()">📥 Export</button>
+          <button class="tbtn" style="padding:2px 9px;font-size:10px" onclick="bc_export()">📥 Export CSV</button>
         </div>
       </div>
       <div class="panel-body">
-        <div class="notice ni-b" style="margin-bottom:8px">Re-Check fetches each target page and scans for your comment text. Moderated comments can take hours or days to appear.</div>
+        <div class="notice ni-b" style="margin-bottom:8px;font-size:10px">Re-Check fetches each target and scans for your comment. Moderated comments can take hours–days to appear. <strong style="color:var(--yellow)">Best practice:</strong> wait 24h then re-check.</div>
         <div class="g4" style="margin-bottom:8px">
           <div class="stat"><div class="stat-v sv-g">${approved}</div><div class="stat-l">✓ Live</div></div>
           <div class="stat"><div class="stat-v sv-y">${allComments.filter(c=>c.approvalStatus==='pending'||c.status==='pending_moderation').length}</div><div class="stat-l">⏳ Pending</div></div>
@@ -5813,33 +5867,106 @@ function render_commenter(el){
       </div>
     </div>
     ${allComments.length?`<div class="panel" style="margin-top:8px"><div class="panel-head">All Comments <span class="badge bg">${allComments.length}</span></div>
-      <div class="panel-body" style="padding:0"><div class="tbl-wrap"><table>
-        <thead><tr><th>#</th><th>Target</th><th>Name</th><th>Anchor</th><th>CMS</th><th>Method</th><th>Status</th><th>Approval</th><th>Date</th><th></th></tr></thead>
+      <div class="panel-body" style="padding:0"><div class="tbl-wrap" style="max-height:55vh;overflow-y:auto"><table>
+        <thead><tr><th>#</th><th>Target</th><th>Name</th><th>Anchor</th><th>CMS</th><th>Method</th><th>Status</th><th>Approval</th><th>Comment Preview</th><th>Date</th><th></th></tr></thead>
         <tbody>${allComments.slice().reverse().map((c,i)=>`<tr>
           <td class="mono xs tm">${allComments.length-i}</td>
-          <td class="mono xs" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${esc(c.target)}" target="_blank">${esc(c.target.replace(/https?:\/\//,'').slice(0,38))}</a></td>
+          <td class="mono xs" style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${esc(c.target)}" target="_blank">${esc(c.target.replace(/https?:\/\//,'').slice(0,35))}</a></td>
           <td class="xs">${esc(c.name)}</td>
-          <td class="xs tm" style="max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.kw||'')}">${esc((c.kw||'').slice(0,20))}</td>
-          <td><span class="badge ${c.cms==='wordpress'?'bg':'bgray'}">${c.cms||'?'}</span></td>
-          <td><span class="badge ${c.method==='xmlrpc'?'bb':c.method==='form_post'?'bp':'bgray'}">${c.method||'?'}</span></td>
-          <td><span class="badge ${['posted','live'].includes(c.status)?'bg':c.status==='pending_moderation'?'by':'br'}">${c.status||'?'}</span></td>
-          <td><span class="badge ${c.approvalStatus==='approved'?'bg':c.approvalStatus==='pending'?'by':c.approvalStatus==='rejected'?'br':'bgray'}">${c.approvalStatus||'—'}</span></td>
+          <td class="xs tm" style="max-width:70px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.kw||'')}">${esc((c.kw||'').slice(0,18))}</td>
+          <td><span class="badge ${c.cms==='wordpress'?'bg':'bgray'}" style="font-size:8px">${c.cms||'?'}</span></td>
+          <td><span class="badge ${c.method==='railway'?'bg':c.method==='xmlrpc'?'bb':c.method==='form_post'?'bp':'bgray'}" style="font-size:8px">${c.method||'?'}</span></td>
+          <td><span class="badge ${['posted','live'].includes(c.status)?'bg':c.status==='pending_moderation'?'by':'br'}" style="font-size:8px">${c.status||'?'}</span></td>
+          <td><span class="badge ${c.approvalStatus==='approved'?'bg':c.approvalStatus==='pending'?'by':c.approvalStatus==='rejected'?'br':'bgray'}" style="font-size:8px">${c.approvalStatus||'—'}</span></td>
+          <td class="xs tm" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text3)" title="${esc(c.comment||c.submittedText||'')}">${esc(((c.comment||c.submittedText||'').slice(0,55)))}…</td>
           <td class="mono xs tm">${esc(c.date)}</td>
           <td><button class="tbtn" style="padding:1px 5px;font-size:9px" onclick="bc_recheckOne(${allComments.length-1-i})">🔄</button></td>
         </tr>`).join('')}</tbody>
-      </table></div></div></div>`:'<div class="panel"><div class="panel-body mono xs tm">No comments yet.</div></div>'}
+      </table></div></div></div>`
+    :'<div class="panel"><div class="panel-body mono xs tm">No comments posted yet.</div></div>'}
   </div>
 
-  <!-- ═══ TEMPLATES TAB ═══ -->
+  <!-- ■ AI COMMENTS TAB ■ -->
+  <div style="display:${activeTab==='ai'?'block':'none'}">
+    <div class="g2">
+      <div class="panel">
+        <div class="panel-head">🤖 AI-Generated Comments <span class="badge by">Beta</span></div>
+        <div class="panel-body">
+          <div class="notice ni-b" style="margin-bottom:8px;font-size:10px">Uses Claude API to generate contextual, unique comments for each target URL. Comments are scraped from the actual page content — far more natural than templates alone.</div>
+          <div class="fg" style="margin-bottom:6px">
+            <label class="lbl">Mode</label>
+            <select id="bc-ai-mode">
+              <option value="off">Off — use templates only</option>
+              <option value="fallback">Fallback — AI if no template matches</option>
+              <option value="all">All — AI-generate every comment</option>
+              <option value="blend">Blend — mix AI and template 50/50</option>
+            </select>
+          </div>
+          <div class="fg" style="margin-bottom:6px">
+            <label class="lbl">AI Comment Persona</label>
+            <textarea id="bc-ai-persona" rows="3" placeholder="You are a real person commenting on blog posts. Sound natural, genuine, and knowledgeable. Reference the article topic. Keep comments 2-3 sentences. End with a relevant question."></textarea>
+          </div>
+          <div class="fg" style="margin-bottom:6px">
+            <label class="lbl">Comment Length</label>
+            <select id="bc-ai-length">
+              <option value="short">Short (1-2 sentences)</option>
+              <option value="medium" selected>Medium (2-3 sentences)</option>
+              <option value="long">Long (3-4 sentences + question)</option>
+            </select>
+          </div>
+          <div class="fg" style="margin-bottom:6px">
+            <label class="lbl">Tone</label>
+            <select id="bc-ai-tone">
+              <option value="natural">Natural reader</option>
+              <option value="expert">Industry expert</option>
+              <option value="curious">Curious learner</option>
+              <option value="skeptical">Skeptical but positive</option>
+            </select>
+          </div>
+          <button class="tbtn go" onclick="bc_aiTestComment()" style="margin-top:4px">🤖 Generate Test Comment</button>
+          <div id="bc-ai-test-result" style="display:none;margin-top:8px;padding:8px;background:var(--win-panel2);border:1px solid var(--win-border);border-radius:2px;font-size:11px;line-height:1.7;color:var(--text)"></div>
+        </div>
+      </div>
+      <div>
+        <div class="panel">
+          <div class="panel-head">📝 AI Comment Log</div>
+          <div class="panel-body">
+            <div style="font-size:10px;color:var(--text3);margin-bottom:8px">Last 10 AI-generated comments from this session:</div>
+            <div id="bc-ai-log">
+              ${(SS.get('rf_bc_ai_log',[])||[]).slice(-10).reverse().map(item=>`
+                <div style="margin-bottom:8px;padding:6px;background:var(--win-panel2);border-radius:2px;border-left:2px solid var(--blue)">
+                  <div class="mono xs tm" style="color:var(--text3);margin-bottom:3px">${esc(item.url||'')}</div>
+                  <div style="font-size:11px;color:var(--text)">${esc(item.comment||'')}</div>
+                </div>`).join('') || '<div class="mono xs tm" style="color:var(--text3)">No AI comments generated yet.</div>'}
+            </div>
+            <button class="tbtn stop" onclick="SS.set('rf_bc_ai_log',[]);render_commenter(document.getElementById('page-commenter'))" style="font-size:9px;padding:1px 6px;margin-top:8px">🗑 Clear Log</button>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:8px">
+          <div class="panel-head">💡 AI Tips</div>
+          <div class="panel-body" style="font-size:10px;color:var(--text2);line-height:1.8">
+            • <strong style="color:var(--green)">Blend mode</strong> gives best natural ratio — some template, some AI<br>
+            • Short comments (1-2 sentences) get approved faster on strict blogs<br>
+            • "Curious learner" tone feels least automated, higher approval rate<br>
+            • AI mode requires Railway or a working internet connection to Claude API<br>
+            • Always include the anchor keyword naturally in the persona prompt<br>
+            • For CommentLuv blogs, longer comments (expert tone) drive more link value
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ■ TEMPLATES TAB ■ -->
   <div style="display:${activeTab==='templates'?'block':'none'}">
     <div class="g2">
       <div class="panel">
         <div class="panel-head">✍ Templates <span class="badge bg">${templates.length}</span>
-          <div class="ph-r"><button class="tbtn" style="padding:1px 6px;font-size:9px" onclick="bc_resetTpls()">Reset</button></div>
+          <div class="ph-r"><button class="tbtn" style="padding:1px 6px;font-size:9px" onclick="bc_resetTpls()">Reset to Defaults</button></div>
         </div>
         <div class="panel-body">
-          <div class="notice ni-b" style="margin-bottom:6px">Placeholders: <code style="color:var(--green)">{url}</code> <code style="color:var(--green)">{kw}</code> <code style="color:var(--green)">{anchor}</code> — Spin: <code style="color:var(--yellow)">{Good|Great|Nice}</code></div>
-          <textarea id="bc-tpl" rows="3" placeholder="{Great|Excellent|Nice} article! Found {url} useful for {kw}."></textarea>
+          <div class="notice ni-b" style="margin-bottom:6px;font-size:10px">Placeholders: <code style="color:var(--green)">{url}</code> <code style="color:var(--green)">{kw}</code> <code style="color:var(--green)">{anchor}</code> — Spin: <code style="color:var(--yellow)">{Good|Great|Nice}</code></div>
+          <textarea id="bc-tpl" rows="4" placeholder="{Great|Excellent|Interesting} post! I've been looking at {kw} lately and your breakdown really helped. I've been comparing with {url} as well — what do you think about recent changes in this space?"></textarea>
           <button class="tbtn go mt6" onclick="bc_addTpl()">➕ Add Template</button>
           <div style="margin-top:10px">${templates.map((t,i)=>`
             <div style="display:flex;gap:5px;align-items:flex-start;padding:7px;border:1px solid var(--win-border);border-radius:2px;margin-bottom:4px;background:var(--win-panel2)">
@@ -5849,113 +5976,134 @@ function render_commenter(el){
         </div>
       </div>
       <div class="panel">
-        <div class="panel-head">🎯 Style Guide</div>
+        <div class="panel-head">📖 Style Guide & Tips</div>
         <div class="panel-body" style="font-size:11px;line-height:1.8;color:var(--text2)">
           <div style="margin-bottom:8px"><strong style="color:var(--green)">Natural</strong> — First-person, conversational. Sounds like a genuine reader.</div>
           <div style="margin-bottom:8px"><strong style="color:var(--blue)">Expert</strong> — References testing/comparing. Positions commenter as experienced.</div>
           <div style="margin-bottom:8px"><strong style="color:var(--yellow)">Question</strong> — Ends with question to author. More engagement, less spam-like.</div>
           <div style="margin-bottom:8px"><strong style="color:var(--purple)">Compliment</strong> — Opens with specific praise referencing article topic.</div>
           <div style="margin-bottom:8px"><strong style="color:var(--cyan)">Mixed</strong> — Randomly picks any style per comment. Best for mass volume.</div>
-          <div style="padding-top:8px;border-top:1px solid var(--win-border)"><strong style="color:var(--text3)">Tips for mass backlinks:</strong><br>
-            • Keep comments 2-4 sentences — longer gets held for moderation<br>
-            • Use spin syntax {word1|word2} to vary each comment<br>
-            • Include the anchor keyword naturally in the comment text<br>
-            • Multiple anchors in "Anchor Keywords" = natural variation across posts
+          <div style="padding-top:8px;border-top:1px solid var(--win-border)"><strong style="color:var(--text3)">Tips:</strong><br>
+            • 2–4 sentences = approved faster; longer → held for moderation<br>
+            • Use {spin|syntax} to avoid duplicate content penalties<br>
+            • Include anchor keyword <em>naturally</em> in comment body — not forced<br>
+            • Multiple anchors in keyword list = link diversity across posts
           </div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- ═══ XML-RPC / PROXY TAB ═══ -->
+  <!-- ■ DIAGNOSTICS TAB ■ -->
   <div style="display:${activeTab==='xmlrpc'?'block':'none'}">
     <div class="g2">
       <div>
+        <!-- Backend Connection Diagnostics -->
         <div class="panel">
-          <div class="panel-head">🔧 XML-RPC Direct Poster</div>
+          <div class="panel-head">🔌 Backend Connection Status</div>
           <div class="panel-body">
-            <div class="notice ni-y" style="margin-bottom:8px">Posts directly to <code>/xmlrpc.php</code> — bypasses comment form entirely. Works on most WordPress installs unless explicitly disabled.</div>
-            <div class="notice ni-b" style="margin-bottom:8px">
-              <strong style="color:var(--yellow)">ℹ Supabase in this app = data sync only.</strong> It stores your results/settings, not execute HTTP requests. For true server-side posting (zero CORS limits), deploy a Supabase Edge Function and paste the URL below. Otherwise the app uses corsproxy.io → allorigins → crossorigin.me fallback chain.
+            <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px">
+              <!-- Railway -->
+              <div style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--win-panel2);border:1px solid var(--win-border);border-radius:2px">
+                <span style="font-family:var(--mono);font-size:10px;color:var(--text2);width:90px;flex-shrink:0">🚂 Railway</span>
+                <span id="bc-diag-rw" style="font-family:var(--mono);font-size:10px;color:${rwStatus==='ok'?'var(--green)':rwStatus==='err'?'var(--red)':'var(--text3)'}">${rwUrl?(rwStatus==='ok'?'● Connected ('+rwLatency+'ms)':rwStatus==='err'?'✗ Error — check URL in Settings':'◌ Not tested'):'○ Not configured (Settings → Railway)'}</span>
+                ${rwUrl?`<button class="tbtn" style="padding:1px 7px;font-size:9px;margin-left:auto" onclick="bc_testBackend()">Test</button>`:''}
+              </div>
+              <!-- Edge Function -->
+              <div style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--win-panel2);border:1px solid var(--win-border);border-radius:2px">
+                <span style="font-family:var(--mono);font-size:10px;color:var(--text2);width:90px;flex-shrink:0">⚡ Edge Fn</span>
+                <span id="bc-diag-ef" style="font-family:var(--mono);font-size:10px;color:${edgeFn?'var(--blue)':'var(--text3)'}">${edgeFn?'◌ Configured (click Test)':'○ Not configured'}</span>
+                ${edgeFn?`<button class="tbtn" style="padding:1px 7px;font-size:9px;margin-left:auto" onclick="bc_testEdgeFn()">Test</button>`:''}
+              </div>
+              <!-- CORS Chain -->
+              <div style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--win-panel2);border:1px solid var(--win-border);border-radius:2px">
+                <span style="font-family:var(--mono);font-size:10px;color:var(--text2);width:90px;flex-shrink:0">🔗 Proxy Chain</span>
+                <span id="bc-diag-prx" style="font-family:var(--mono);font-size:10px;color:var(--yellow)">◌ Fallback only — browser CORS limits apply</span>
+                <button class="tbtn" style="padding:1px 7px;font-size:9px;margin-left:auto" onclick="bc_testProxyChain()">Test</button>
+              </div>
             </div>
-            <div class="fg"><label class="lbl">Supabase Edge Function URL <span style="color:var(--text3);font-weight:normal">(optional — true server-side, bypasses all CORS)</span></label>
+            <div class="fg">
+              <label class="lbl">Supabase Edge Function URL <span style="color:var(--text3);font-weight:normal">(optional)</span></label>
               <input type="url" id="bc-edge-fn" placeholder="https://xxxx.supabase.co/functions/v1/comment-poster" value="${esc(edgeFn)}" oninput="localStorage.setItem('rf_bc_edge_fn',this.value);log('Edge function URL saved','ok')"/>
             </div>
-            <div style="margin-bottom:10px;font-size:10px;color:var(--text3);line-height:1.7">Edge function receives: <code style="color:var(--cyan)">{ type:'xmlrpc'|'form', url, xml|body }</code> → returns <code style="color:var(--cyan)">{ body: '...' }</code></div>
+          </div>
+        </div>
+
+        <!-- XML-RPC Direct Test -->
+        <div class="panel" style="margin-top:8px">
+          <div class="panel-head">🔧 XML-RPC Manual Test</div>
+          <div class="panel-body">
+            <div class="notice ni-y" style="margin-bottom:8px;font-size:10px">Posts directly to <code>/xmlrpc.php</code> — bypasses comment form entirely. Most effective method for WordPress.</div>
             <div class="fg"><label class="lbl">Target WordPress Post URL</label><input type="url" id="xrpc-target" placeholder="https://example.com/2024/01/some-post/"/></div>
             <div class="fg"><label class="lbl">Post ID (0 = auto-detect)</label><input type="number" id="xrpc-postid" value="0" min="0"/></div>
             <div class="g2">
               <div class="fg"><label class="lbl">Author Name</label><input type="text" id="xrpc-name" placeholder="Alex Reid"/></div>
               <div class="fg"><label class="lbl">Author Email</label><input type="email" id="xrpc-email" placeholder="alex.reid99@gmail.com"/></div>
             </div>
-            <div class="fg"><label class="lbl">Author URL (your backlink)</label><input type="url" id="xrpc-authorurl" placeholder="https://yoursite.com"/></div>
-            <div class="fg"><label class="lbl">Comment Text</label><textarea id="xrpc-comment" rows="4" placeholder="Write your comment here..."></textarea></div>
+            <div class="fg"><label class="lbl">Author URL (backlink)</label><input type="url" id="xrpc-authorurl" placeholder="https://yoursite.com"/></div>
+            <div class="fg"><label class="lbl">Comment Text</label><textarea id="xrpc-comment" rows="3" placeholder="Write your comment here..."></textarea></div>
             <div class="flex g6 mt8">
               <button class="tbtn go" onclick="bc_xmlrpcTest()">▶ Post via XML-RPC</button>
-              <button class="tbtn" onclick="bc_xmlrpcProbe()">🔬 Probe XML-RPC Status</button>
+              <button class="tbtn" onclick="bc_xmlrpcProbe()">🔬 Probe Status</button>
             </div>
             <div id="xrpc-result" style="display:none;margin-top:8px" class="notice ni-b"></div>
           </div>
         </div>
       </div>
+
       <div>
+        <!-- XML-RPC Probe -->
         <div class="panel">
           <div class="panel-head">🔬 XML-RPC Probe</div>
           <div class="panel-body">
             <div class="fg"><label class="lbl">Domain to Probe</label><input type="url" id="xrpc-probe-url" placeholder="https://example.com"/></div>
             <button class="tbtn go mt6" onclick="bc_xmlrpcProbeUrl()">Probe</button>
             <div id="xrpc-probe-result" style="margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--text2);line-height:1.8"></div>
-            <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--win-border);font-size:10px;color:var(--text2);line-height:1.7">
-              <strong style="color:var(--text3)">CORS Proxy Chain for POSTs:</strong><br>
-              1. <code style="color:var(--green)">corsproxy.io</code> (primary — reliable POST support)<br>
-              2. <code style="color:var(--yellow)">allorigins.win/raw</code> (fallback)<br>
-              3. <code style="color:var(--text3)">crossorigin.me</code> (tertiary)<br>
-              4. <code style="color:var(--blue)">Edge Function</code> (if configured — server-side, no CORS)<br><br>
-              <strong style="color:var(--text3)">GET Chain:</strong> allorigins → corsproxy.io → codetabs → thingproxy
+            <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--win-border);font-size:10px;color:var(--text2);line-height:1.8">
+              <strong style="color:var(--text3)">POST Proxy Chain:</strong><br>
+              1. <code style="color:var(--green)">Railway</code> (server-side, best)<br>
+              2. <code style="color:var(--blue)">Edge Fn</code> (Supabase, server-side)<br>
+              3. <code style="color:var(--yellow)">corsproxy.io</code> (CORS proxy fallback)<br>
+              4. <code style="color:var(--text3)">allorigins.win</code> (tertiary)<br>
+              5. <code style="color:var(--text3)">crossorigin.me</code> (last resort)
             </div>
           </div>
         </div>
+        <!-- Edge Fn Code Snippet -->
         <div class="panel" style="margin-top:8px">
-          <div class="panel-head">📋 Supabase Edge Function Code</div>
+          <div class="panel-head">📋 Supabase Edge Function</div>
           <div class="panel-body">
-            <div style="font-size:10px;color:var(--text3);margin-bottom:6px">Deploy this to Supabase Edge Functions for true server-side posting:</div>
-            <div style="font-size:10px;color:var(--green);margin-bottom:6px;line-height:1.8">
+            <div style="font-size:10px;color:var(--green);margin-bottom:8px;line-height:1.8">
               <strong>Deploy steps:</strong><br>
-              1. Install Supabase CLI: <code>npm i -g supabase</code><br>
-              2. <code>supabase login</code><br>
-              3. <code>supabase functions new comment-poster</code><br>
-              4. Paste the downloaded <code>index.ts</code> into <code>supabase/functions/comment-poster/index.ts</code><br>
-              5. <code>supabase functions deploy comment-poster --no-verify-jwt</code><br>
-              6. Copy the function URL → paste into the field above<br>
-              <span style="color:var(--yellow)">⚠ Use <code>--no-verify-jwt</code> so RankForge can call it without auth headers</span>
+              1. <code>npm i -g supabase</code><br>
+              2. <code>supabase login</code> + <code>supabase functions new comment-poster</code><br>
+              3. Paste <code>index.ts</code> → <code>supabase functions deploy comment-poster --no-verify-jwt</code><br>
+              4. Copy URL → paste in field above
             </div>
-            <div style="font-size:10px;color:var(--text3);margin-bottom:6px">The full <code>index.ts</code> is in the downloaded <strong>comment-poster-edge-fn.ts</strong> file alongside this HTML. It handles three modes: <code>wp_comment</code> (full session flow), <code>form_comment</code> (generic blogs), <code>xmlrpc</code> (direct XML-RPC). The function fetches the page server-side to get the real nonce + session cookies, then POSTs the comment in the same session — exactly how a real browser does it.</div>
-            <pre style="font-family:var(--mono);font-size:9px;color:var(--cyan);background:var(--win-bg);border:1px solid var(--win-border);padding:8px;overflow-x:auto;line-height:1.5;border-radius:2px;max-height:160px">// Excerpt — download full index.ts file
+            <pre style="font-family:var(--mono);font-size:9px;color:var(--cyan);background:var(--win-bg);border:1px solid var(--win-border);padding:8px;overflow-x:auto;line-height:1.5;border-radius:2px;max-height:140px">// Excerpt — download full index.ts
 Deno.serve(async (req) => {
-  const { type, pageUrl, author, email, website, comment, ... } = await req.json();
+  const { type, pageUrl, author, email, website, comment } = await req.json();
   if (type === "wp_comment") {
-    // 1. GET post page → extract cookies + nonce + postId
     const page = await fetch(pageUrl, { headers: { "User-Agent": "..." } });
     const cookies = parseCookies(page.headers);
     const html = await page.text();
     const nonce = extractNonce(html);
     const postId = extractPostId(html);
-    // 2. POST comment in SAME session (cookies forwarded)
     const post = await fetch(actionUrl, {
-      method: "POST", headers: { Cookie: cookies, Referer: pageUrl, ... },
-      body: buildParams({ comment_post_ID: postId, _wpnonce: nonce, author, email, ... })
+      method: "POST",
+      headers: { Cookie: cookies, Referer: pageUrl },
+      body: buildParams({ comment_post_ID: postId, _wpnonce: nonce, author, email })
     });
-    // 3. Interpret redirect / response and return result
   }
 });</pre>
-            <button class="tbtn" style="margin-top:6px" onclick="navigator.clipboard.writeText(document.querySelector('#page-commenter pre').textContent);log('Snippet copied — download the full file for complete code','ok')">📋 Copy Snippet</button>
+            <button class="tbtn" style="margin-top:6px" onclick="navigator.clipboard.writeText(document.querySelector('#page-commenter pre').textContent);log('Snippet copied','ok')">📋 Copy Snippet</button>
           </div>
         </div>
       </div>
     </div>
   </div>`;
 
-  // Live URL count
+  // Live URL count on Config tab
   const ta = document.getElementById('bc-targets');
   const cnt = document.getElementById('bc-url-count');
   if(ta && cnt) {
@@ -5965,9 +6113,70 @@ Deno.serve(async (req) => {
   }
 }
 
+// ── BACKEND DIAGNOSTICS ───────────────────────────────────────────────────────
+async function bc_testBackend() {
+  log('[Diagnostics] Testing Railway backend...','info');
+  SS.rawSet('rf_bc_rw_status','unchecked');
+  const t0 = Date.now();
+  try {
+    const ok = await RW.test();
+    const latency = Date.now()-t0;
+    if(ok) {
+      SS.rawSet('rf_bc_rw_status','ok');
+      SS.rawSet('rf_bc_rw_latency', latency+'');
+      log(`[Railway] ✓ Connected — ${latency}ms`,'ok');
+    } else {
+      SS.rawSet('rf_bc_rw_status','err');
+      log('[Railway] ✗ Health check failed — server responded but not OK','err');
+    }
+  } catch(e) {
+    SS.rawSet('rf_bc_rw_status','err');
+    log(`[Railway] ✗ Cannot reach: ${e.message}`,'err');
+  }
+  render_commenter(document.getElementById('page-commenter'));
+}
+
+async function bc_testEdgeFn() {
+  const url = localStorage.getItem('rf_bc_edge_fn');
+  if(!url){log('No edge function URL set','err');return;}
+  log('[Edge Fn] Testing...','info');
+  const el = document.getElementById('bc-diag-ef');
+  try {
+    const r = await _origFetch(url, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({type:'ping'}),
+      signal: AbortSignal.timeout(8000)
+    });
+    const d = await r.json().catch(()=>({}));
+    if(el) el.textContent = '● Connected';
+    if(el) el.style.color='var(--green)';
+    log(`[Edge Fn] ✓ Reachable (status ${r.status})`,'ok');
+  } catch(e) {
+    if(el) el.textContent = '✗ Error: '+e.message;
+    if(el) el.style.color='var(--red)';
+    log(`[Edge Fn] ✗ ${e.message}`,'err');
+  }
+}
+
+async function bc_testProxyChain() {
+  log('[Proxy Chain] Testing corsproxy.io...','info');
+  const el = document.getElementById('bc-diag-prx');
+  try {
+    const r = await _origFetch('https://corsproxy.io/?url=https://httpbin.org/get', {signal:AbortSignal.timeout(8000)});
+    const ok = r.ok;
+    if(el) el.textContent = ok ? '● corsproxy.io available' : '⚠ Limited response';
+    if(el) el.style.color = ok ? 'var(--green)' : 'var(--yellow)';
+    log(`[Proxy Chain] corsproxy.io: ${ok?'✓ available':'⚠ limited'}`,'ok');
+  } catch(e) {
+    if(el) el.textContent = '✗ All proxies may be blocked in your browser';
+    if(el) el.style.color='var(--red)';
+    log(`[Proxy Chain] ✗ ${e.message} — configure Railway for reliable posting`,'err');
+  }
+}
+
 // ── QUEUE MANAGEMENT ──────────────────────────────────────────────────────────
 function bc_buildQueue(targets, moneyUrl, websiteField, kwList) {
-  // Build fresh queue with per-URL metadata, respecting max-per-domain
   const maxPerDomain = parseInt(SS.raw('rf_bc_maxperdomain')||'3');
   const domainCount = {};
   const queue = [];
@@ -5976,20 +6185,20 @@ function bc_buildQueue(targets, moneyUrl, websiteField, kwList) {
       const domain = new URL(url).hostname.replace(/^www\./,'');
       domainCount[domain] = (domainCount[domain]||0) + 1;
       if (domainCount[domain] > maxPerDomain) {
-        log(`[Queue] Skipping ${url.slice(0,40)} — domain limit (${maxPerDomain}) reached`,'warn');
+        log(`[Queue] Skip ${url.slice(0,40)} — domain limit (${maxPerDomain})`,'warn');
         continue;
       }
       const kw = kwList[rand(0, kwList.length-1)] || 'keyword';
-      queue.push({ url, moneyUrl, websiteField, kw, done:false, status:'queued', cms:null, method:null, reason:null });
+      queue.push({ url, moneyUrl, websiteField, kw, done:false, status:'queued', cms:null, method:null, reason:null, comment:null });
     } catch(e) {}
   }
   SS.set('rf_bc_queue', queue);
-  log(`[Queue] Built ${queue.length} URLs (${targets.length - queue.length} skipped by domain limit)`, 'ok');
+  log(`[Queue] Built ${queue.length} items (${targets.length - queue.length} skipped by domain limit)`, 'ok');
   return queue;
 }
 
 function bc_clearQueue() {
-  if(!confirm('Clear the queue? This does not clear comment results.')) return;
+  if(!confirm('Clear the queue? (Does not clear comment results.)')) return;
   SS.set('rf_bc_queue', []);
   render_commenter(document.getElementById('page-commenter'));
   log('Queue cleared','warn');
@@ -6044,7 +6253,8 @@ function bc_importTxt() {
   inp.click();
 }
 
-async function bc_buildQueueAndStart() {
+// ── MAIN EXECUTE (replaces "Build Queue + Start" / "Start Instantly" split) ───
+async function bc_execute() {
   const targetsRaw=(document.getElementById('bc-targets')||{value:''}).value.trim();
   const moneyUrl=(document.getElementById('bc-url')||{value:''}).value.trim();
   if(!targetsRaw||!moneyUrl){log('Enter target URLs and your money URL first','err');return;}
@@ -6053,23 +6263,107 @@ async function bc_buildQueueAndStart() {
   const kwRaw=(document.getElementById('bc-kw')||{value:''}).value.trim();
   const kwList=kwRaw.split('\n').map(k=>k.trim()).filter(Boolean);
   if(!kwList.length){log('Enter at least one anchor keyword','err');return;}
+
+  // Auto-test backend silently before starting if not yet tested
+  if(RW.enabled && SS.raw('rf_bc_rw_status')!=='ok') {
+    log('[Pre-flight] Testing Railway connection...','info');
+    await bc_testBackend();
+  }
+
   const batchSize=parseInt(SS.raw('rf_bc_batchsize')||'0');
   const queue=bc_buildQueue(targets, moneyUrl, websiteField, kwList);
-  if(!queue.length){log('Queue is empty after deduplication','err');return;}
-  // If batchSize set, only queue up to that many
+  if(!queue.length){log('Queue empty after deduplication','err');return;}
   const toRun=batchSize>0?queue.slice(0,batchSize):queue;
-  log(`[Queue] Starting ${toRun.length} of ${queue.length} URLs${batchSize?` (batch of ${batchSize})`:''}`, 'info');
+  log(`[Execute] Starting ${toRun.length} of ${queue.length} URLs${batchSize?` (batch: ${batchSize})`:''}`, 'info');
+
+  // Switch to live grid view while running
+  SS.rawSet('rf_commenter_tab','live');
+  render_commenter(document.getElementById('page-commenter'));
+
   await bc_runQueue(toRun);
 }
 
 async function bc_resumeQueue() {
   const queue=SS.get('rf_bc_queue',[]);
   const remaining=queue.filter(q=>!q.done);
-  if(!remaining.length){log('No remaining items in queue — all done or queue is empty','warn');return;}
+  if(!remaining.length){log('No remaining items — all done or queue empty','warn');return;}
   const batchSize=parseInt(SS.raw('rf_bc_batchsize')||'0');
   const toRun=batchSize>0?remaining.slice(0,batchSize):remaining;
-  log(`[Queue] Resuming — ${toRun.length} remaining`,'info');
+  log(`[Resume] ${toRun.length} remaining`,'info');
+  SS.rawSet('rf_commenter_tab','live');
+  render_commenter(document.getElementById('page-commenter'));
   await bc_runQueue(toRun);
+}
+
+// ── AI COMMENT GENERATION ─────────────────────────────────────────────────────
+async function bc_generateAIComment(pageHtml, targetUrl, moneyUrl, kw, options={}) {
+  try {
+    const titleMatch = pageHtml.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].replace(/\s*[-|].*$/,'').trim() : targetUrl;
+    const bodyText = pageHtml.replace(/<script[^>]*>[\s\S]*?<\/script>/gi,'')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi,'')
+      .replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().slice(0,800);
+
+    const persona = (document.getElementById('bc-ai-persona')||{value:''}).value.trim()
+      || 'You are a real person leaving a blog comment. Sound natural and genuine. Keep it 2-3 sentences.';
+    const length = (document.getElementById('bc-ai-length')||{value:'medium'}).value;
+    const tone = (document.getElementById('bc-ai-tone')||{value:'natural'}).value;
+    const lenMap = {short:'1-2 sentences',medium:'2-3 sentences',long:'3-4 sentences ending with a question'};
+
+    const prompt = `${persona}
+
+Write a blog comment for this article:
+Title: "${title}"
+Article excerpt: "${bodyText.slice(0,400)}"
+
+Requirements:
+- Length: ${lenMap[length]||'2-3 sentences'}
+- Tone: ${tone}
+- Naturally mention or reference: "${kw}"
+- DO NOT include your name, email, or any links directly in the text
+- DO NOT start with "Great post!" or generic openers
+- Sound like a real reader who actually read the article
+- Return ONLY the comment text, nothing else`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+    if(!response.ok) throw new Error(`API ${response.status}`);
+    const data = await response.json();
+    const comment = data.content?.find(b=>b.type==='text')?.text?.trim();
+    if(!comment) throw new Error('empty AI response');
+
+    // Log to AI log
+    const aiLog = SS.get('rf_bc_ai_log',[]);
+    aiLog.push({url:targetUrl, comment, date:today()});
+    if(aiLog.length > 50) aiLog.splice(0, aiLog.length-50);
+    SS.set('rf_bc_ai_log', aiLog);
+
+    return comment;
+  } catch(e) {
+    log(`[AI Comment] Failed for ${targetUrl.slice(0,35)}: ${e.message}`, 'warn');
+    return null;
+  }
+}
+
+async function bc_aiTestComment() {
+  const moneyUrl = (document.getElementById('bc-url')||{value:''}).value.trim() || 'https://yoursite.com';
+  const kwList = ((document.getElementById('bc-kw')||{value:''}).value || 'best VPN').split('\n').filter(Boolean);
+  const kw = kwList[0] || 'best VPN';
+  const resultEl = document.getElementById('bc-ai-test-result');
+  if(resultEl) { resultEl.style.display='block'; resultEl.textContent='Generating AI comment...'; }
+  const fakeHtml = `<title>Test Article About ${kw}</title><body>This article discusses ${kw} in depth, covering all the key aspects you need to know for ${new Date().getFullYear()}.</body>`;
+  const comment = await bc_generateAIComment(fakeHtml, 'https://test.example.com/', moneyUrl, kw);
+  if(resultEl) {
+    resultEl.textContent = comment || 'Failed to generate — check console for errors.';
+    resultEl.style.color = comment ? 'var(--text)' : 'var(--red)';
+  }
 }
 
 // ── MAIN ENGINE ───────────────────────────────────────────────────────────────
@@ -6084,33 +6378,65 @@ async function bc_runQueue(toRun) {
   const captchaKey=SS.raw('rf_captcha_key');
   const templates=SS.get('rf_ctpls',CTPLS);
   const isDryRun=method==='detect';
+  const aiMode=(document.getElementById('bc-ai-mode')||{value:'off'}).value;
+  const threads=Math.max(1,Math.min(10,parseInt(SS.raw('rf_bc_threads')||'3')||3));
+
+  // Progress elements (in live grid tab)
   const prog=document.getElementById('bc-prog');
   const progLbl=document.getElementById('bc-prog-label');
 
   APP.running=true; APP.stopFlag=false;
   setStatus(isDryRun?'Detecting CMS...':'Commenting...');
-  log(`▶ Mass Commenter — ${toRun.length} targets · method:${method}${useProxy?' · proxies':''}${isDryRun?' · DRY RUN':''}`, 'info');
+  log(`▶ Mass Commenter — ${toRun.length} targets · method:${method} · threads:${threads}${useProxy?' · proxies':''}${isDryRun?' · DRY RUN':''}`, 'info');
 
-  // Get the full queue to update done flags
   let fullQueue = SS.get('rf_bc_queue', []);
+  let processed = 0;
 
-  for(let i=0; i<toRun.length; i++){
-    if(APP.stopFlag) break;
-    const item = toRun[i];
+  // Helper to update live grid row inline without full re-render
+  function updateLiveRow(targetUrl, status, cms, methodUsed, reason, comment) {
+    // Update the full queue in memory + storage
+    const qi = fullQueue.findIndex(q=>q.url===targetUrl&&!q.done);
+    if(qi>-1) {
+      fullQueue[qi].done=true;
+      fullQueue[qi].status=status;
+      fullQueue[qi].cms=cms||null;
+      fullQueue[qi].method=methodUsed||null;
+      fullQueue[qi].reason=reason||null;
+      if(comment) fullQueue[qi].comment=comment;
+    }
+    SS.set('rf_bc_queue',fullQueue);
+    // Update progress bar
+    processed++;
+    const pct = Math.round((processed/toRun.length)*100);
+    if(prog) prog.style.width=pct+'%';
+    if(progLbl) progLbl.textContent=`${processed}/${toRun.length}`;
+    setProgress(pct, `${processed}/${toRun.length}`);
+    // Lightweight row update — refresh just the tbody
+    const tbody = document.getElementById('bc-live-tbody');
+    if(tbody) {
+      const rows = tbody.querySelectorAll('tr');
+      const rowIdx = [...fullQueue].findIndex(q=>q.url===targetUrl);
+      if(rows[rowIdx]) {
+        const badgeClass = ['posted','live','pending_moderation'].includes(status)?'bg':status==='failed'?'br':'bgray';
+        const methodBadge = methodUsed==='railway'?'bg':methodUsed==='xmlrpc'?'bb':methodUsed==='form_post'?'bp':'bgray';
+        rows[rowIdx].cells[2].innerHTML=`<span class="badge ${cms==='wordpress'?'bg':'bgray'}" style="font-size:8px">${cms||'—'}</span>`;
+        rows[rowIdx].cells[3].innerHTML=`<span class="badge ${methodBadge}" style="font-size:8px">${methodUsed||'—'}</span>`;
+        rows[rowIdx].cells[4].innerHTML=`<span class="badge ${badgeClass}" style="font-size:8px">${status||'?'}</span>`;
+        rows[rowIdx].cells[5].textContent=reason||'—';
+        if(comment && rows[rowIdx].cells[6]) rows[rowIdx].cells[6].title=comment;
+        rows[rowIdx].style.opacity=status==='failed'||status==='detected_only'?'0.55':'1';
+      }
+    }
+  }
+
+  // Process a single URL
+  async function processUrl(item) {
+    if(APP.stopFlag) return;
     const target = item.url;
     const moneyUrl = item.moneyUrl || SS.raw('rf_bc_moneyurl') || '';
     const websiteField = item.websiteField || moneyUrl;
     const kw = item.kw || 'keyword';
 
-    if(prog) prog.style.width=Math.round(((i+1)/toRun.length)*100)+'%';
-    if(progLbl) progLbl.textContent=`${i+1}/${toRun.length}`;
-    setProgress(Math.round(((i+1)/toRun.length)*100), `${i+1}/${toRun.length}`);
-
-    let tpl=templates[rand(0,templates.length-1)];
-    if(spinOn) tpl=bc_spin(tpl);
-    const comment=tpl.replace(/{url}/g,moneyUrl).replace(/{kw}/g,kw).replace(/{anchor}/g,kw);
-    const name=nameField||CNAMES[rand(0,CNAMES.length-1)];
-    const email=bc_genEmail(name,emailPat);
     const proxy=useProxy?getNextProxy():null;
     if(proxy) log(`[Proxy] ${proxyLabel(proxy)} → ${target.slice(0,35)}`,'info');
 
@@ -6123,16 +6449,29 @@ async function bc_runQueue(toRun) {
       log(`[Detect] ${target.slice(0,40)} → ${cmsInfo.cms} (${cmsInfo.confidence})`,cmsInfo.cms!=='unknown'?'ok':'warn');
     }catch(e){
       log(`[Detect] ${target.slice(0,40)} → fetch failed: ${e.message}`,'err');
-      const record={target,comment,name,email,kw,website:websiteField,status:'failed',cms:'unknown',method:'failed',reason:'fetch_error: '+e.message,date:today(),submittedText:comment,approvalStatus:'unknown'};
+      const record={target,comment:'',name:'',email:'',kw,website:websiteField,status:'failed',cms:'unknown',method:'failed',reason:'fetch_error: '+e.message,date:today(),submittedText:'',approvalStatus:'unknown'};
       APP.comments.push(record); SS.set('rf_comments',APP.comments);
       APP.stats.failed++; APP.stats.processed++; updateStats();
-      // Mark queue item done
-      const qi = fullQueue.findIndex(q=>q.url===target&&!q.done);
-      if(qi>-1){fullQueue[qi].done=true;fullQueue[qi].status='failed';fullQueue[qi].reason='fetch_error';fullQueue[qi].cms='unknown';}
-      SS.set('rf_bc_queue',fullQueue);
-      await sleep(useVariance?bc_humanDelay(baseDelay):baseDelay);
-      continue;
+      updateLiveRow(target,'failed','unknown','failed','fetch_error',null);
+      return;
     }
+
+    // Step 2: Build comment text (AI or template)
+    let tpl=templates[rand(0,templates.length-1)];
+    if(spinOn) tpl=bc_spin(tpl);
+    let commentText=tpl.replace(/{url}/g,moneyUrl).replace(/{kw}/g,kw).replace(/{anchor}/g,kw);
+
+    // AI comment generation
+    if(aiMode!=='off' && html) {
+      const useAI = aiMode==='all' || (aiMode==='blend' && Math.random()<0.5) || aiMode==='fallback';
+      if(useAI) {
+        const aiComment = await bc_generateAIComment(html, target, moneyUrl, kw);
+        if(aiComment) commentText = aiComment;
+      }
+    }
+
+    const name=nameField||CNAMES[rand(0,CNAMES.length-1)];
+    const email=bc_genEmail(name,emailPat);
 
     // Extract form fields
     let formInfo=bc_extractForm(html,target);
@@ -6142,16 +6481,15 @@ async function bc_runQueue(toRun) {
     }
 
     if(isDryRun){
-      log(`[DryRun] cms:${cmsInfo.cms} postId:${formInfo.postId||'?'} nonce:${formInfo.nonce?'✓':'✗'} action:${formInfo.action?formInfo.action.slice(0,45):'?'} fields:[${(formInfo.detectedFieldNames||[]).slice(0,6).join(',')}]`,'info');
-      const record={target,comment,name,email,kw,website:websiteField,status:'detected_only',cms:cmsInfo.cms,method:'detect',reason:'dry_run',date:today(),submittedText:comment,approvalStatus:'unknown'};
+      log(`[DryRun] cms:${cmsInfo.cms} postId:${formInfo.postId||'?'} nonce:${formInfo.nonce?'✓':'✗'} action:${formInfo.action?formInfo.action.slice(0,45):'?'}`,'info');
+      const record={target,comment:commentText,name,email,kw,website:websiteField,status:'detected_only',cms:cmsInfo.cms,method:'detect',reason:'dry_run',date:today(),submittedText:commentText,approvalStatus:'unknown'};
       APP.comments.push(record); SS.set('rf_comments',APP.comments);
-      const qi=fullQueue.findIndex(q=>q.url===target&&!q.done);
-      if(qi>-1){fullQueue[qi].done=true;fullQueue[qi].status='detected_only';fullQueue[qi].cms=cmsInfo.cms;}
-      SS.set('rf_bc_queue',fullQueue);
-      APP.stats.processed++; updateStats(); await sleep(500); continue;
+      APP.stats.processed++; updateStats();
+      updateLiveRow(target,'detected_only',cmsInfo.cms,'detect','dry_run',commentText);
+      return;
     }
 
-    // Step 2: Captcha detection
+    // Step 3: Captcha handling
     let captchaToken=null;
     const capMatch=html.match(/data-sitekey="([^"]+)"/);
     if(capMatch&&captchaKey){
@@ -6159,39 +6497,40 @@ async function bc_runQueue(toRun) {
       captchaToken=await solveCaptcha(capMatch[1],target);
       if(captchaToken) log('[Captcha] Token ✓','ok');
     }
-    if(capMatch&&!captchaKey) log(`[Captcha] reCAPTCHA detected — no solver key set, may fail`,'warn');
+    if(capMatch&&!captchaKey) log(`[Captcha] reCAPTCHA detected — no solver key set`,'warn');
 
-    // Step 3: Post — Railway server-side (best) → XML-RPC → Form POST
+    // Step 4: Post — Railway → XML-RPC → Form POST
     let result={ok:false,method:'none',reason:'no_attempt'};
     const tryXmlrpc=method==='xmlrpc'||(method==='auto'&&cmsInfo.cms==='wordpress');
     const tryForm=method==='form'||method==='auto';
+    const tryRailway=method==='auto'||method==='railway_only';
 
-    // ── RAILWAY: real server-side posting with cookies/sessions ──
-    if(RW.enabled){
+    // Railway (server-side, best)
+    if(RW.enabled && tryRailway){
       log(`[Railway] commenting → ${target.slice(0,40)}`,'info');
       try{
-        const r=await RW.comment({url:target,authorName:name,authorEmail:email,authorUrl:websiteField,comment,method,captchaToken:captchaToken||null});
+        const r=await RW.comment({url:target,authorName:name,authorEmail:email,authorUrl:websiteField,comment:commentText,method,captchaToken:captchaToken||null});
         if(r && (r.ok || r.method)) { result=r; log(`[Railway] ${result.ok?'✓':'✗'} ${result.method||''} ${result.reason||''}`,result.ok?'ok':'warn'); }
-      }catch(e){ log(`[Railway] error: ${e.message} — falling back to proxy chain`,'warn'); }
+      }catch(e){ log(`[Railway] error: ${e.message} — falling back`,'warn'); }
     }
 
-    // ── PROXY FALLBACK: XML-RPC then Form POST ──
-    if(!result.ok){
-      if(tryXmlrpc&&cmsInfo.cms==='wordpress'){
-        log(`[XML-RPC] → ${target.slice(0,40)}`,'info');
-        result=await bc_xmlrpcPost(new URL(target).origin,formInfo.postId||'0',{authorName:name,authorEmail:email,authorUrl:websiteField,content:comment});
-        log(`[XML-RPC] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
-      }
-      if(!result.ok&&tryForm){
-        log(`[Form POST] cms:${cmsInfo.cms} → ${target.slice(0,40)}`,'info');
-        let actionUrl=formInfo.action;
-        if(!actionUrl){ actionUrl=cmsInfo.cms==='wordpress'?new URL('/wp-comments-post.php',target).href:target; }
-        result=await bc_formPost({...formInfo,author:name,email,website:websiteField,comment,pageUrl:target},actionUrl,captchaToken,cmsInfo.cms);
-        log(`[Form POST] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
-      }
+    // XML-RPC fallback
+    if(!result.ok && tryXmlrpc && cmsInfo.cms==='wordpress'){
+      log(`[XML-RPC] → ${target.slice(0,40)}`,'info');
+      result=await bc_xmlrpcPost(new URL(target).origin,formInfo.postId||'0',{authorName:name,authorEmail:email,authorUrl:websiteField,content:commentText});
+      log(`[XML-RPC] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
     }
 
-    // Step 4: Record result
+    // Form POST fallback
+    if(!result.ok && tryForm){
+      log(`[Form POST] cms:${cmsInfo.cms} → ${target.slice(0,40)}`,'info');
+      let actionUrl=formInfo.action;
+      if(!actionUrl){ actionUrl=cmsInfo.cms==='wordpress'?new URL('/wp-comments-post.php',target).href:target; }
+      result=await bc_formPost({...formInfo,author:name,email,website:websiteField,comment:commentText,pageUrl:target},actionUrl,captchaToken,cmsInfo.cms);
+      log(`[Form POST] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
+    }
+
+    // Step 5: Record result
     let finalStatus='failed', approvalStatus='unknown';
     if(result.ok){
       finalStatus=result.reason==='live'?'live':result.reason==='pending_moderation'?'pending_moderation':'posted';
@@ -6199,29 +6538,45 @@ async function bc_runQueue(toRun) {
       APP.stats.success++;
     } else { APP.stats.failed++; }
 
-    const record={target,comment,name,email,kw,website:websiteField,status:finalStatus,approvalStatus,cms:cmsInfo.cms,method:result.method,reason:result.reason,commentId:result.commentId||null,proxy:proxy?proxy.addr:null,date:today(),submittedText:comment};
+    const record={target,comment:commentText,name,email,kw,website:websiteField,status:finalStatus,approvalStatus,cms:cmsInfo.cms,method:result.method,reason:result.reason,commentId:result.commentId||null,proxy:proxy?proxy.addr:null,date:today(),submittedText:commentText};
     APP.comments.push(record);
     SS.set('rf_comments',APP.comments);
-
-    // Update queue item
-    const qi=fullQueue.findIndex(q=>q.url===target&&!q.done);
-    if(qi>-1){fullQueue[qi].done=true;fullQueue[qi].status=finalStatus;fullQueue[qi].cms=cmsInfo.cms;fullQueue[qi].method=result.method;fullQueue[qi].reason=result.reason;}
-    SS.set('rf_bc_queue',fullQueue);
-
     APP.stats.processed++; updateStats();
-    await sleep(useVariance?bc_humanDelay(baseDelay):baseDelay);
+
+    updateLiveRow(target,finalStatus,cmsInfo.cms,result.method,result.reason,commentText);
   }
+
+  // Execute with concurrency (threads)
+  // Simple semaphore-style concurrent processing
+  const semaphore = threads;
+  let inFlight = 0;
+  let idx = 0;
+
+  await new Promise(resolve => {
+    function runNext() {
+      while(inFlight < semaphore && idx < toRun.length && !APP.stopFlag) {
+        const item = toRun[idx++];
+        inFlight++;
+        const delay = useVariance ? bc_humanDelay(baseDelay) : baseDelay;
+        sleep(inFlight===1?0:delay*Math.random()).then(()=>processUrl(item)).then(()=>{
+          inFlight--;
+          if(idx < toRun.length && !APP.stopFlag) runNext();
+          else if(inFlight===0) resolve();
+        });
+      }
+      if(idx >= toRun.length && inFlight===0) resolve();
+    }
+    runNext();
+  });
 
   APP.running=false; setStatus('Done');
   const s=APP.comments.reduce((a,c)=>{a[c.status]=(a[c.status]||0)+1;return a},{});
-  log(`▶ Done — ${JSON.stringify(s)}`,'ok');
+  log(`▶ Complete — ${JSON.stringify(s)}`,'ok');
   render_commenter(document.getElementById('page-commenter'));
 }
 
-// Keep backwards compat with old start button wiring
-async function start_commenter(){
-  await bc_buildQueueAndStart();
-}
+// Backwards compat
+async function start_commenter(){ await bc_execute(); }
 
 function bc_preview(){
   const moneyUrl=(document.getElementById('bc-url')||{value:''}).value.trim()||SS.raw('rf_bc_moneyurl')||'https://yoursite.com';
@@ -6232,7 +6587,7 @@ function bc_preview(){
   const spinOn=(document.getElementById('bc-spin')||{value:'yes'}).value==='yes';
   const templates=SS.get('rf_ctpls',CTPLS);
   const previews=[];
-  for(let i=0;i<4;i++){
+  for(let i=0;i<5;i++){
     let tpl=templates[rand(0,templates.length-1)];
     if(spinOn)tpl=bc_spin(tpl);
     const comment=tpl.replace(/{url}/g,moneyUrl).replace(/{kw}/g,kw).replace(/{anchor}/g,kw);
@@ -6242,14 +6597,13 @@ function bc_preview(){
   }
   const panel=document.getElementById('bc-preview-panel');
   const body=document.getElementById('bc-preview-body');
-  if(body)body.innerHTML=previews.map((p,i)=>`
-    <div style="margin-bottom:10px;padding:8px;background:var(--win-panel2);border-radius:2px;border:1px solid var(--win-border)">
+  if(body)body.innerHTML=`<div style="margin-bottom:6px;font-size:10px;color:var(--text3)">5 sample comment variants — actual run rotates all templates:</div>`+previews.map((p,i)=>`
+    <div style="margin-bottom:8px;padding:8px;background:var(--win-panel2);border-radius:2px;border:1px solid var(--win-border)">
       <div class="mono xs tm" style="margin-bottom:4px">Variant ${i+1} — <strong style="color:var(--green)">${esc(p.name)}</strong> <span style="color:var(--text3);margin-left:8px">${esc(p.email)}</span> <span style="color:var(--cyan);margin-left:8px">anchor: ${esc(p.kw)}</span></div>
       <div style="font-size:11px;color:var(--text2);line-height:1.6">${esc(p.comment)}</div>
     </div>`).join('');
-  if(panel)panel.style.display='block';
+  if(panel) panel.style.display='block';
 }
-
 
 // ── APPROVAL ─────────────────────────────────────────────────────────────────
 async function bc_recheckOne(i){
@@ -6315,7 +6669,6 @@ async function bc_xmlrpcProbeUrl(overrideUrl){
   log(`[XML-RPC Probe] ${url}`,'info');
   try{
     const origin=new URL(url).origin;const xmlrpcUrl=origin+'/xmlrpc.php';
-    // GET probe to check if xmlrpc.php responds
     const body=await bc_proxyGet(xmlrpcUrl,10000);
     const xmlrpcEnabled=body.includes('XML-RPC server accepts POST requests only')||body.includes('xmlrpc')||body.includes('methodResponse');
     const methodsXml=`<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>`;
@@ -6329,9 +6682,9 @@ async function bc_xmlrpcProbeUrl(overrideUrl){
     }catch(e){}
     const hasComment=methods.includes('wp.newComment');
     const output=[
-      `xmlrpc.php reachable: ${xmlrpcEnabled?'✓ YES (will accept POST)':'✗ NO / disabled / returns non-XML'}`,
-      `wp.newComment available: ${hasComment?'✓ YES — commenting should work':'✗ NOT found in method list'}`,
-      `Total wp.* methods found: ${methods.length}`,
+      `xmlrpc.php reachable: ${xmlrpcEnabled?'✓ YES':'✗ NO / disabled'}`,
+      `wp.newComment available: ${hasComment?'✓ YES':'✗ NOT found'}`,
+      `wp.* methods found: ${methods.length}`,
       methods.length?'Methods: '+methods.slice(0,6).join(', ')+(methods.length>6?` +${methods.length-6} more`:''):'No wp.* methods detected',
     ];
     if(resultDiv)resultDiv.innerHTML=output.map(l=>`<div>${esc(l)}</div>`).join('');
@@ -6346,7 +6699,10 @@ async function bc_xmlrpcProbeUrl(overrideUrl){
 function bc_addTpl(){const t=(document.getElementById('bc-tpl')||{value:''}).value.trim();if(!t)return;const tpls=SS.get('rf_ctpls',CTPLS);tpls.push(t);SS.set('rf_ctpls',tpls);render_commenter(document.getElementById('page-commenter'));log(`Template added (${tpls.length} total)`,'ok');}
 function bc_delTpl(i){const t=SS.get('rf_ctpls',CTPLS);t.splice(i,1);SS.set('rf_ctpls',t);render_commenter(document.getElementById('page-commenter'));}
 function bc_resetTpls(){SS.set('rf_ctpls',CTPLS);render_commenter(document.getElementById('page-commenter'));log('Templates reset','ok');}
-function bc_export(){dlCSV('Target,Name,Email,CMS,Method,Status,ApprovalStatus,Reason,CommentID,Date,Comment\n'+APP.comments.map(c=>`"${c.target}","${c.name}","${c.email||''}","${c.cms||''}","${c.method||''}","${c.status}","${c.approvalStatus||''}","${c.reason||''}","${c.commentId||''}","${c.date}","${(c.comment||'').replace(/"/g,"'")}"`).join('\n'),'comments_export.csv');log(`Exported ${APP.comments.length} records`,'ok');}
+function bc_export(){dlCSV('Target,Name,Email,CMS,Method,Status,ApprovalStatus,Reason,CommentID,Date,Comment\n'+APP.comments.map(c=>`"${c.target}","${c.name}","${c.email||''}","${c.cms||''}","${c.method||''}","${c.status}","${c.approvalStatus||''}","${c.reason||''}","${c.commentId||''}","${c.date}","${(c.comment||c.submittedText||'').replace(/"/g,"'")}"`).join('\n'),'comments_export.csv');log(`Exported ${APP.comments.length} records`,'ok');}
+function bc_loadList(){const ta=document.getElementById('bc-targets');if(ta)ta.value=APP.urlList.join('\n');}
+
+
 
 // ═══════════════════════════════════════════════════
 // LINK BUILDER

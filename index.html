@@ -15636,6 +15636,8 @@ async function prx_corsGet(url, timeoutMs=18000){
   }
   throw new Error(`Railway + all CORS proxies failed — last error: ${lastErr?.message}`);
 }
+// Alias used by Blog Commenter — bc_proxyGet was referenced but never declared
+const bc_proxyGet = prx_corsGet;
 
 async function prx_fetchSource(source){
   const raw = await prx_corsGet(source.url, 20000);

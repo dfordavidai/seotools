@@ -1,4 +1,5 @@
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5337,248 +5338,325 @@ function bc_extractForm(html, pageUrl) {
   return result;
 }
 
-// ── CORS POST PROXIES ─────────────────────────────────────────────────────────
-// corsproxy.io supports real POST forwarding with response passthrough.
-// allorigins/raw is a fallback but often strips responses. crossorigin.me is tertiary.
+// ══════════════════════════════════════════════════════════════════════════
+// BLOG COMMENTER — POSTING ENGINE v5.0
+// ══════════════════════════════════════════════════════════════════════════
+//
+// ROOT CAUSE OF FALSE POSITIVES (now fixed):
+//
+// 1. XML-RPC: `methodResponse` check triggered on FAULT responses too.
+//    Fixed: check explicitly for faultCode / commentId, not just tag presence.
+//
+// 2. Form POST: `r.status===200` catch-all marked every proxy response as success.
+//    Fixed: REMOVED. We only succeed on explicit confirmation text.
+//
+// 3. Form POST: response contains existing page comments, matching class="comment".
+//    Fixed: we now check for POST-SPECIFIC confirmation strings only.
+//
+// 4. WordPress nonce is session-bound: fetched via allorigins, POST via corsproxy
+//    = two different HTTP sessions = WordPress silently rejects.
+//    Fixed: Without Railway/Edge Fn, we skip form POST for WordPress entirely
+//    and rely on XML-RPC (which needs no nonce/session).
+//
+// 5. bc_proxyPost returned ok:true just for getting ANY text back from proxy.
+//    Fixed: bc_proxyPost returns raw transport result; callers do the parsing.
+//
+// POSTING PRIORITY ORDER:
+//   1. Railway backend (server-side, full session+cookie, most reliable)
+//   2. Supabase Edge Function (server-side, good)  
+//   3. XML-RPC (no session needed, works on most WP — best no-backend option)
+//   4. Form POST via CORS proxy (non-WP only; WP skipped without backend)
+//
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TRANSPORT: raw proxy POST ─────────────────────────────────────────────
+// Returns { sent: bool, text: string, proxy: string }
+// Does NOT return ok:true/false — callers interpret the response text.
 const BC_POST_PROXIES = [
-  { name:'corsproxy.io',    wrap: u => `https://corsproxy.io/?${encodeURIComponent(u)}`,    ct: c => ({'Content-Type':c,'x-requested-with':'XMLHttpRequest'}) },
-  { name:'allorigins/raw',  wrap: u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, ct: c => ({'Content-Type':c}) },
-  { name:'crossorigin.me',  wrap: u => `https://crossorigin.me/${u}`,                        ct: c => ({'Content-Type':c,'X-Requested-With':'XMLHttpRequest'}) },
+  { name: 'corsproxy.io',  wrap: u => `https://corsproxy.io/?${encodeURIComponent(u)}`,              headers: c => ({ 'Content-Type': c, 'X-Requested-With': 'XMLHttpRequest' }) },
+  { name: 'allorigins',    wrap: u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, headers: c => ({ 'Content-Type': c }) },
 ];
 
-async function bc_proxyPost(targetUrl, body, contentType='application/x-www-form-urlencoded', timeoutMs=14000) {
-  let lastErr = null;
+async function bc_rawProxyPost(targetUrl, body, contentType, timeoutMs = 15000) {
   for (const px of BC_POST_PROXIES) {
     try {
       const resp = await _origFetch(px.wrap(targetUrl), {
         method: 'POST',
-        headers: px.ct(contentType),
+        headers: px.headers(contentType),
         body,
-        signal: AbortSignal.timeout(timeoutMs)
+        signal: AbortSignal.timeout(timeoutMs),
       });
       const text = await resp.text();
-      if (text && text.length > 20) return { ok:true, text, proxy:px.name, status:resp.status };
-      lastErr = new Error(`empty from ${px.name}`);
-    } catch(e) { lastErr = e; log(`[Proxy POST] ${px.name} failed: ${e.message}`,'warn'); }
+      return { sent: true, text: text || '', proxy: px.name, httpStatus: resp.status };
+    } catch (e) {
+      log(`[ProxyPOST] ${px.name} error: ${e.message}`, 'warn');
+    }
   }
-  return { ok:false, text:'', proxy:'none', error:lastErr?.message||'all proxies failed' };
+  return { sent: false, text: '', proxy: 'none', httpStatus: 0 };
 }
 
-// ── WORDPRESS XML-RPC POSTER ─────────────────────────────────────────────────
+// ── XML-RPC ───────────────────────────────────────────────────────────────
+// Most reliable method without a backend — no session/nonce required.
 async function bc_xmlrpcPost(siteUrl, postId, commentData) {
-  const {authorName,authorEmail,authorUrl,content}=commentData;
-  const safe = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  const xmlBody=`<?xml version="1.0"?><methodCall><methodName>wp.newComment</methodName><params><param><value><string>${safe(siteUrl)}</string></value></param><param><value><int>0</int></value></param><param><value><string></string></value></param><param><value><int>${postId||1}</int></value></param><param><value><struct><member><n>author</n><value><string>${safe(authorName)}</string></value></member><member><n>author_email</n><value><string>${safe(authorEmail)}</string></value></member><member><n>author_url</n><value><string>${safe(authorUrl)}</string></value></member><member><n>content</n><value><string>${safe(content)}</string></value></member></struct></value></param></params></methodCall>`;
-  try {
-    const xmlrpcUrl = new URL('/xmlrpc.php', siteUrl).href;
-    // Check if user configured a Supabase Edge Function for server-side POSTing
-    const edgeFnUrl = localStorage.getItem('rf_bc_edge_fn');
-    let responseText = '';
-    if (edgeFnUrl) {
-      try {
-        const r = await _origFetch(edgeFnUrl, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({type:'xmlrpc', url:xmlrpcUrl, xml:xmlBody}),
-          signal: AbortSignal.timeout(20000)
-        });
-        const d = await r.json();
-        responseText = d.body || d.text || d.result || '';
-        log(`[XML-RPC] Edge function ✓ (server-side)`,'ok');
-      } catch(e) {
-        log(`[XML-RPC] Edge function failed (${e.message}), falling back to proxy`,'warn');
-      }
-    }
-    if (!responseText) {
-      const r = await bc_proxyPost(xmlrpcUrl, xmlBody, 'text/xml', 12000);
-      if (!r.ok) return {ok:false,method:'xmlrpc',reason:r.error||'proxy_post_failed'};
-      responseText = r.text;
-      log(`[XML-RPC] via ${r.proxy}`,'info');
-    }
-    if (responseText.includes('<fault>')) {
-      const faultMsg = responseText.match(/<string>([^<]+)<\/string>/)?.[1]||'XML-RPC fault';
-      const faultCode = responseText.match(/<int>(\d+)<\/int>/)?.[1]||'?';
-      if(faultCode==='403')return{ok:false,method:'xmlrpc',reason:'xmlrpc_disabled'};
-      if(faultCode==='500')return{ok:false,method:'xmlrpc',reason:'anon_comments_disabled'};
-      if(faultCode==='801')return{ok:false,method:'xmlrpc',reason:'duplicate_comment'};
-      return{ok:false,method:'xmlrpc',reason:faultMsg};
-    }
-    const commentIdMatch = responseText.match(/<int>(\d+)<\/int>/);
-    if(commentIdMatch)return{ok:true,method:'xmlrpc',commentId:commentIdMatch[1],reason:'submitted'};
-    if(responseText.includes('methodResponse'))return{ok:true,method:'xmlrpc',reason:'submitted'};
-    return{ok:false,method:'xmlrpc',reason:'unexpected_xmlrpc_response'};
-  } catch(e) { return{ok:false,method:'xmlrpc',reason:e.message}; }
-}
+  const { authorName, authorEmail, authorUrl, content } = commentData;
+  const xe = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// ── FORM POST VIA MULTI-PROXY ─────────────────────────────────────────────────
-// Supports: WordPress, Generic HTML forms, Blogger, Ghost, any standard comment form
-async function bc_formPost(formData, actionUrl, captchaToken, cms='generic') {
-  try {
-    if(!actionUrl) return{ok:false,method:'form_post',reason:'no_action_url_found'};
-    const params = new URLSearchParams();
+  const xmlBody = [
+    '<?xml version="1.0"?>',
+    '<methodCall><methodName>wp.newComment</methodName><params>',
+    `<param><value><string>${xe(siteUrl)}</string></value></param>`,
+    '<param><value><int>0</int></value></param>',   // username (anon)
+    '<param><value><string></string></value></param>', // password (anon)
+    `<param><value><int>${parseInt(postId) || 1}</int></value></param>`,
+    '<param><value><struct>',
+    `<member><name>author</name><value><string>${xe(authorName)}</string></value></member>`,
+    `<member><name>author_email</name><value><string>${xe(authorEmail)}</string></value></member>`,
+    `<member><name>author_url</name><value><string>${xe(authorUrl)}</string></value></member>`,
+    `<member><name>content</name><value><string>${xe(content)}</string></value></member>`,
+    '</struct></value></param>',
+    '</params></methodCall>',
+  ].join('');
 
-    // WordPress-specific hidden fields
-    Object.entries(formData.fields||{}).forEach(([k,v])=>params.append(k,v));
-    if(formData.postId) params.append('comment_post_ID', formData.postId);
-    if(formData.nonce)  params.append('_wpnonce', formData.nonce);
+  const xmlrpcUrl = (() => { try { return new URL('/xmlrpc.php', siteUrl).href; } catch { return ''; } })();
+  if (!xmlrpcUrl) return { ok: false, method: 'xmlrpc', reason: 'invalid_site_url' };
 
-    // Universal comment form fields (works on WP, generic, Ghost, others)
-    const fieldMap = {
-      // WordPress field names
-      author:  formData.author||'',
-      email:   formData.email||'',
-      url:     formData.website||'',
-      comment: formData.comment||'',
-      submit:  'Post Comment',
-      comment_parent: '0',
-      // Common generic/non-WP field aliases
-      name:       formData.author||'',
-      message:    formData.comment||'',
-      content:    formData.comment||'',
-      body:       formData.comment||'',
-      website:    formData.website||'',
-      homepage:   formData.website||'',
-    };
+  // Railway first
+  if (RW.enabled) {
+    try {
+      const r = await RW.fetch('/comment', { url: xmlrpcUrl, type: 'xmlrpc', xml: xmlBody }, 22000);
+      if (r && typeof r.ok === 'boolean') return { ok: r.ok, method: 'xmlrpc_railway', reason: r.reason || '', commentId: r.commentId };
+    } catch (e) { log(`[XMLRPC] Railway error: ${e.message}`, 'warn'); }
+  }
 
-    // Only append fields that the form actually uses (detected from HTML)
-    const detectedFields = formData.detectedFieldNames || [];
-    if (detectedFields.length > 0) {
-      // Targeted: only send fields the form asked for
-      detectedFields.forEach(fn => {
-        if (fieldMap[fn] !== undefined) params.set(fn, fieldMap[fn]);
+  // Edge Function
+  const efUrl = localStorage.getItem('rf_bc_edge_fn');
+  if (efUrl) {
+    try {
+      const resp = await _origFetch(efUrl, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'xmlrpc', url: xmlrpcUrl, xml: xmlBody }),
+        signal: AbortSignal.timeout(22000),
       });
-      // Always include WordPress core fields if WP
-      if(cms==='wordpress') {
-        if(formData.postId) params.set('comment_post_ID', formData.postId);
-        if(formData.nonce)  params.set('_wpnonce', formData.nonce);
-        params.set('submit','Post Comment');
-        params.set('comment_parent','0');
-      }
-    } else {
-      // Fallback: send all common fields
-      Object.entries(fieldMap).forEach(([k,v])=>{ if(v) params.set(k,v); });
-    }
+      const d = await resp.json();
+      const raw = d.body || d.text || d.result || '';
+      return bc_parseXmlrpcResponse(raw, 'xmlrpc_edgefn');
+    } catch (e) { log(`[XMLRPC] Edge fn error: ${e.message}`, 'warn'); }
+  }
 
-    if(captchaToken) params.append('g-recaptcha-response', captchaToken);
-
-    const edgeFnUrl = localStorage.getItem('rf_bc_edge_fn');
-    let respText = '';
-    if (edgeFnUrl) {
-      // Route through Supabase Edge Function — full server-side session-aware POST
-      // The edge function does: GET page (session+cookies+nonce) → POST comment — all server-side
-      try {
-        const efPayload = {
-          type: cms === 'wordpress' ? 'wp_comment' : 'form_comment',
-          pageUrl: formData.pageUrl || actionUrl, // pageUrl = original post URL for session fetch
-          actionUrl: actionUrl,
-          // For wp_comment, pass individual fields — edge fn builds the form
-          author: formData.author || '',
-          email: formData.email || '',
-          website: formData.website || '',
-          comment: formData.comment || '',
-          // For form_comment, pass all fields as-is
-          fields: {
-            ...formData.fields,
-            author: formData.author||'', name: formData.author||'',
-            email: formData.email||'',
-            url: formData.website||'', website: formData.website||'',
-            comment: formData.comment||'', message: formData.comment||'', content: formData.comment||'',
-          }
-        };
-        const r = await _origFetch(edgeFnUrl, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(efPayload),
-          signal: AbortSignal.timeout(25000)
-        });
-        const d = await r.json();
-        log(`[Form POST] Edge function ✓ (server-side) → ${d.reason}`,'ok');
-        if (d.reason === 'duplicate_comment') return{ok:false,method:'form_post',reason:'duplicate_comment'};
-        if (d.reason === 'marked_spam') return{ok:false,method:'form_post',reason:'marked_spam'};
-        if (d.reason === 'captcha_required') return{ok:false,method:'form_post',reason:'captcha_required'};
-        if (d.reason === 'nonce_invalid') return{ok:false,method:'form_post',reason:'nonce_invalid'};
-        if (d.ok) return{ok:true,method:'form_post',reason:d.reason||'submitted'};
-        return{ok:false,method:'form_post',reason:d.reason||'edge_fn_failed'};
-      } catch(e) {
-        log(`[Form POST] Edge function failed (${e.message}), falling back to proxy`,'warn');
-      }
-    }
-    // Fallback: browser-side proxy chain (less reliable for modern WP)
-    const r = await bc_proxyPost(actionUrl, params.toString(), 'application/x-www-form-urlencoded', 14000);
-    if (!r.ok) return{ok:false,method:'form_post',reason:r.error||'proxy_post_failed'};
-    respText = r.text;
-    log(`[Form POST] via ${r.proxy} → ${actionUrl.slice(0,40)}`,'info');
-
-    // Interpret response
-    if(/duplicate|already said|already commented/i.test(respText)) return{ok:false,method:'form_post',reason:'duplicate_comment'};
-    if(/spam|akismet/i.test(respText)) return{ok:false,method:'form_post',reason:'marked_spam'};
-    if(/captcha|are you human|verify/i.test(respText)) return{ok:false,method:'form_post',reason:'captcha_required'};
-    if(/awaiting.*moderation|held.*moderation|moderation queue|thank.*you.*comment|comment.*submitted/i.test(respText)) return{ok:true,method:'form_post',reason:'pending_moderation'};
-    if(/class="comment|comment-\d+|your comment (was|has been)|comment posted|thanks for.*comment/i.test(respText)) return{ok:true,method:'form_post',reason:'live'};
-    if(/error|invalid|required field/i.test(respText)&&!/comment/i.test(respText)) return{ok:false,method:'form_post',reason:'form_validation_error'};
-    // If we got a substantial response and no obvious error, consider it submitted
-    if(r.status===200||r.status===302) return{ok:true,method:'form_post',reason:'submitted'};
-    return{ok:false,method:'form_post',reason:`http_${r.status}`};
-  } catch(e) { return{ok:false,method:'form_post',reason:e.message}; }
+  // CORS proxy fallback
+  const { sent, text } = await bc_rawProxyPost(xmlrpcUrl, xmlBody, 'text/xml', 15000);
+  if (!sent || !text) return { ok: false, method: 'xmlrpc', reason: 'proxy_transport_failed' };
+  return bc_parseXmlrpcResponse(text, 'xmlrpc_proxy');
 }
 
-// ── GENERIC COMMENT FORM EXTRACTOR (non-WP sites) ────────────────────────────
-function bc_extractGenericForm(html, pageUrl) {
-  const result = {action:null,fields:{},detectedFieldNames:[],method:'POST'};
+function bc_parseXmlrpcResponse(responseText, methodLabel) {
+  if (!responseText) return { ok: false, method: methodLabel, reason: 'empty_response' };
+
+  // Check for fault FIRST — fault response also contains methodResponse tag
+  if (responseText.includes('<fault>')) {
+    const code  = (responseText.match(/<name>faultCode<\/name>[\s\S]*?<int>(-?\d+)<\/int>/) ||
+                   responseText.match(/<int>(-?\d+)<\/int>/))?.[1] || '0';
+    const msg   = responseText.match(/<name>faultString<\/name>[\s\S]*?<string>([^<]*)<\/string>/)?.[1] ||
+                  responseText.match(/<string>([^<]*)<\/string>/)?.[1] || 'xmlrpc_fault';
+    const c = parseInt(code);
+    if (c === 403)  return { ok: false, method: methodLabel, reason: 'xmlrpc_disabled' };
+    if (c === 500)  return { ok: false, method: methodLabel, reason: 'anon_comments_disabled' };
+    if (c === 801)  return { ok: false, method: methodLabel, reason: 'duplicate_comment' };
+    if (c === -32700) return { ok: false, method: methodLabel, reason: 'xmlrpc_parse_error' };
+    return { ok: false, method: methodLabel, reason: `xmlrpc_fault_${c}` };
+  }
+
+  // Success: a positive integer comment ID
+  const idMatch = responseText.match(/<methodResponse>[\s\S]*?<int>(\d+)<\/int>/);
+  if (idMatch && parseInt(idMatch[1]) > 0) {
+    return { ok: true, method: methodLabel, commentId: idMatch[1], reason: 'comment_id_returned' };
+  }
+
+  // Some WP setups return boolean true
+  if (responseText.includes('<boolean>1</boolean>')) {
+    return { ok: true, method: methodLabel, reason: 'boolean_true' };
+  }
+
+  return { ok: false, method: methodLabel, reason: 'unexpected_xmlrpc_response' };
+}
+
+// ── FORM POST ─────────────────────────────────────────────────────────────
+// KEY RULE: Without Railway/EdgeFn, we DO NOT attempt WordPress form POST.
+// WordPress nonces are session-bound and will always fail via CORS proxy.
+// Non-WP sites (Ghost, Blogger, generic) can still work via proxy.
+async function bc_formPost(formData, actionUrl, captchaToken, cms = 'generic') {
+  if (!actionUrl) return { ok: false, method: 'form_post', reason: 'no_action_url' };
+
+  const efUrl = localStorage.getItem('rf_bc_edge_fn');
+
+  // ── 1. Railway (full server-side session — works on all CMS) ──────────
+  if (RW.enabled) {
+    try {
+      const r = await RW.comment({
+        url:        formData.pageUrl || actionUrl,
+        authorName: formData.author  || '',
+        authorEmail:formData.email   || '',
+        authorUrl:  formData.website || '',
+        comment:    formData.comment || '',
+        method:     cms === 'wordpress' ? 'wp_comment' : 'form_comment',
+        captchaToken: captchaToken || null,
+      });
+      if (r && typeof r.ok === 'boolean') {
+        return { ok: r.ok, method: 'form_post_railway', reason: r.reason || '', commentId: r.commentId };
+      }
+    } catch (e) { log(`[FormPOST] Railway error: ${e.message}`, 'warn'); }
+  }
+
+  // ── 2. Edge Function ──────────────────────────────────────────────────
+  if (efUrl) {
+    try {
+      const r = await _origFetch(efUrl, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type:      cms === 'wordpress' ? 'wp_comment' : 'form_comment',
+          pageUrl:   formData.pageUrl || actionUrl,
+          actionUrl,
+          author:    formData.author  || '',
+          email:     formData.email   || '',
+          website:   formData.website || '',
+          comment:   formData.comment || '',
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+      const d = await r.json();
+      return { ok: !!d.ok, method: 'form_post_edgefn', reason: d.reason || '' };
+    } catch (e) { log(`[FormPOST] Edge fn error: ${e.message}`, 'warn'); }
+  }
+
+  // ── 3. CORS proxy — ONLY for non-WordPress ───────────────────────────
+  // WordPress MUST have Railway or Edge Fn; CORS proxy will fail nonce validation.
+  if (cms === 'wordpress') {
+    return { ok: false, method: 'form_post', reason: 'wp_requires_backend_for_session' };
+  }
+
+  // Build form data
+  const params = new URLSearchParams();
+  const fieldMap = {
+    author: formData.author || '', name: formData.author || '',
+    email:  formData.email  || '',
+    url:    formData.website || '', website: formData.website || '', homepage: formData.website || '',
+    comment: formData.comment || '', message: formData.comment || '',
+    content: formData.comment || '', body: formData.comment || '',
+  };
+  // Only send fields the form actually declared
+  const detected = formData.detectedFieldNames || [];
+  if (detected.length > 0) {
+    detected.forEach(fn => { if (fieldMap[fn] !== undefined) params.set(fn, fieldMap[fn]); });
+  } else {
+    Object.entries(fieldMap).forEach(([k, v]) => { if (v) params.set(k, v); });
+  }
+  // Append any hidden fields from the form
+  Object.entries(formData.fields || {}).forEach(([k, v]) => params.set(k, v));
+  if (captchaToken) params.set('g-recaptcha-response', captchaToken);
+
+  const { sent, text, proxy } = await bc_rawProxyPost(actionUrl, params.toString(), 'application/x-www-form-urlencoded', 16000);
+  if (!sent) return { ok: false, method: 'form_post', reason: 'proxy_transport_failed' };
+
+  log(`[FormPOST] ${proxy} response preview: ${text.slice(0, 150).replace(/\s+/g, ' ')}`, 'info');
+
+  // ── Parse response — explicit signals ONLY, no catch-all status:200 ──
+  if (/duplicate|already.*comment|you.*already said/i.test(text))
+    return { ok: false, method: 'form_post', reason: 'duplicate_comment' };
+  if (/spam|akismet.*discarded/i.test(text))
+    return { ok: false, method: 'form_post', reason: 'marked_spam' };
+  if (/captcha|are you a human|verify.*human/i.test(text))
+    return { ok: false, method: 'form_post', reason: 'captcha_required' };
+  if (/awaiting.*moderation|held.*moderation|comment.*moderation queue|comment.*await/i.test(text))
+    return { ok: true,  method: 'form_post', reason: 'pending_moderation' };
+  if (/thank.*you.*(?:comment|posting)|comment.*(?:submitted|received|posted|sent)/i.test(text))
+    return { ok: true,  method: 'form_post', reason: 'submitted_confirmed' };
+  // Generic error signals
+  if (/required field|please fill|fill in all|missing.*field|invalid.*email/i.test(text))
+    return { ok: false, method: 'form_post', reason: 'form_validation_error' };
+  if (/error|invalid|forbidden|not allowed/i.test(text))
+    return { ok: false, method: 'form_post', reason: 'form_error_response' };
+
+  // No confirmation found — genuinely unknown, mark as unverified (not success)
+  return { ok: false, method: 'form_post', reason: 'no_confirmation_in_response' };
+}
+
+// ── FORM EXTRACTORS ───────────────────────────────────────────────────────
+function bc_extractForm(html, pageUrl) {
+  const result = { action: null, postId: null, nonce: null, fields: {}, method: 'POST' };
   try {
-    // Find all comment-related forms
+    const actionMatch =
+      html.match(/action="([^"]*wp-comments-post\.php[^"]*)"/i) ||
+      html.match(/<form[^>]+id="commentform"[^>]*action="([^"]+)"/i) ||
+      html.match(/<form[^>]+class="[^"]*comment[^"]*"[^>]*action="([^"]+)"/i);
+    if (actionMatch) result.action = actionMatch[1].startsWith('http') ? actionMatch[1] : new URL(actionMatch[1], pageUrl).href;
+    else { try { result.action = new URL('/wp-comments-post.php', pageUrl).href; } catch {} }
+
+    const pidMatch = html.match(/name="comment_post_ID"\s+value="(\d+)"/i) || html.match(/comment_post_ID[^>]*value="(\d+)"/i);
+    if (pidMatch) result.postId = pidMatch[1];
+
+    const nonceMatch = html.match(/name="_wpnonce"\s+value="([^"]+)"/i) || html.match(/"nonce":"([^"]+)"/);
+    if (nonceMatch) result.nonce = nonceMatch[1];
+
+    const hiddens = [...html.matchAll(/input[^>]+type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi)];
+    hiddens.forEach(m => { result.fields[m[1]] = m[2]; });
+  } catch {}
+  return result;
+}
+
+function bc_extractGenericForm(html, pageUrl) {
+  const result = { action: null, fields: {}, detectedFieldNames: [], method: 'POST' };
+  try {
     const formMatches = [...html.matchAll(/<form[^>]*(?:comment|respond|reply)[^>]*>([\s\S]*?)<\/form>/gi)];
-    const targetForm = formMatches[0];
+    let targetForm = formMatches[0];
     if (!targetForm) {
-      // Fallback: find any form with a comment/message textarea
       const allForms = [...html.matchAll(/<form([^>]*)>([\s\S]*?)<\/form>/gi)];
       for (const fm of allForms) {
         if (/textarea[^>]*(comment|message|body|content)/i.test(fm[2])) {
-          const actionMatch = fm[1].match(/action="([^"]+)"/i);
-          result.action = actionMatch ? (actionMatch[1].startsWith('http') ? actionMatch[1] : new URL(actionMatch[1],pageUrl).href) : pageUrl;
-          result.detectedFieldNames = [...fm[2].matchAll(/name="([^"]+)"/gi)].map(m=>m[1]);
-          const hiddens = [...fm[2].matchAll(/input[^>]+type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi)];
-          hiddens.forEach(m=>result.fields[m[1]]=m[2]);
+          const a = fm[1].match(/action="([^"]+)"/i);
+          result.action = a ? (a[1].startsWith('http') ? a[1] : new URL(a[1], pageUrl).href) : pageUrl;
+          result.detectedFieldNames = [...fm[2].matchAll(/name="([^"]+)"/gi)].map(m => m[1]);
+          [...fm[2].matchAll(/input[^>]+type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi)]
+            .forEach(m => result.fields[m[1]] = m[2]);
           return result;
         }
       }
       return result;
     }
-    const formAttrs = targetForm[0];
-    const formBody = targetForm[1] || targetForm[0];
-    const actionMatch = formAttrs.match(/action="([^"]+)"/i);
-    result.action = actionMatch ? (actionMatch[1].startsWith('http') ? actionMatch[1] : new URL(actionMatch[1],pageUrl).href) : pageUrl;
-    result.detectedFieldNames = [...formBody.matchAll(/name="([^"]+)"/gi)].map(m=>m[1]);
-    const hiddens = [...formBody.matchAll(/input[^>]+type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi)];
-    hiddens.forEach(m=>result.fields[m[1]]=m[2]);
-  } catch(e) {}
+    const fa = targetForm[0], fb = targetForm[1] || targetForm[0];
+    const a = fa.match(/action="([^"]+)"/i);
+    result.action = a ? (a[1].startsWith('http') ? a[1] : new URL(a[1], pageUrl).href) : pageUrl;
+    result.detectedFieldNames = [...fb.matchAll(/name="([^"]+)"/gi)].map(m => m[1]);
+    [...fb.matchAll(/input[^>]+type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi)]
+      .forEach(m => result.fields[m[1]] = m[2]);
+  } catch {}
   return result;
 }
 
-// ── APPROVAL CHECKER ─────────────────────────────────────────────────────────
+// ── APPROVAL CHECKER ─────────────────────────────────────────────────────
 async function bc_checkApproval(comment) {
-  if(!comment.target||!comment.submittedText)return'unknown';
+  if (!comment.target || !comment.submittedText) return 'unknown';
   try {
-    const html = await bc_proxyGet(comment.target, 10000);
-    if(!html) return 'check_failed';
-    const snippet = comment.submittedText.replace(/[{}<>]/g,'').trim().split(/\s+/).slice(3,9).join(' ');
-    if(snippet.length>10&&html.toLowerCase().includes(snippet.toLowerCase()))return'approved';
-    if(comment.name&&html.includes(comment.name)&&(html.includes('comment-author')||html.includes('comment-body')))return'approved';
-    return'pending';
-  } catch(e) { return'check_failed'; }
+    const html = await bc_proxyGet(comment.target, 12000);
+    if (!html) return 'check_failed';
+    const words  = comment.submittedText.replace(/[{}<>]/g, '').trim().split(/\s+/);
+    const snippet = words.slice(2, 9).join(' ');
+    if (snippet.length > 10 && html.toLowerCase().includes(snippet.toLowerCase())) return 'approved';
+    if (comment.name && html.includes(comment.name) && (html.includes('comment-author') || html.includes('comment-body'))) return 'approved';
+    return 'pending';
+  } catch { return 'check_failed'; }
 }
 
-// ── HELPERS ──────────────────────────────────────────────────────────────────
-// ── HELPERS ──────────────────────────────────────────────────────────────────
-function bc_humanDelay(baseMs){const v=baseMs*0.35;return baseMs+(Math.random()*v*2-v)+rand(0,400);}
-function bc_spin(text){return text.replace(/\{([^{}]+)\}/g,(_,opts)=>{const c=opts.split('|');return c[rand(0,c.length-1)];});}
-function bc_genEmail(name,pattern){
-  const parts=name.toLowerCase().split(/\s+/);const first=parts[0]||'user';const last=parts[1]||'smith';
-  const domains=['gmail.com','yahoo.com','outlook.com','hotmail.com','protonmail.com'];
-  const d=domains[rand(0,domains.length-1)];
-  if(pattern==='firstname.lastname')return`${first}.${last}@${d}`;
-  if(pattern==='firstlast')return`${first}${last}@${d}`;
-  return`${first}${last}${rand(10,99)}@${d}`;
+// ── HELPERS ───────────────────────────────────────────────────────────────
+function bc_humanDelay(baseMs) { const v = baseMs * 0.35; return baseMs + (Math.random() * v * 2 - v) + rand(0, 400); }
+function bc_spin(text) { return text.replace(/\{([^{}]+)\}/g, (_, opts) => { const c = opts.split('|'); return c[rand(0, c.length - 1)]; }); }
+function bc_genEmail(name, pattern) {
+  const p = name.toLowerCase().split(/\s+/); const f = p[0] || 'user'; const l = p[1] || 'smith';
+  const d = ['gmail.com','yahoo.com','outlook.com','hotmail.com','protonmail.com'][rand(0, 4)];
+  if (pattern === 'firstname.lastname') return `${f}.${l}@${d}`;
+  if (pattern === 'firstlast')          return `${f}${l}@${d}`;
+  return `${f}${l}${rand(10, 99)}@${d}`;
 }
+
 function bc_loadList(){const ta=document.getElementById('bc-targets');if(ta)ta.value=APP.urlList.join('\n');}
 // ══════════════════════════════════════════════════════════════════════════════
 // MASS BLOG COMMENTER v4.0  —  Simple. Fill in. Click Start. Watch it run.
@@ -5605,6 +5683,19 @@ function render_commenter(el){
   const pending  = total - done;
   const pct      = total ? Math.round(done/total*100) : 0;
 
+  // Backend detection
+  const rwUrl      = localStorage.getItem('rf_railway_url') || '';
+  const efUrl      = localStorage.getItem('rf_bc_edge_fn') || '';
+  const hasBackend = !!(rwUrl || efUrl);
+  const rwOk       = SS.raw('rf_bc_rw_status','') === 'ok';
+  const rwMs       = SS.raw('rf_bc_rw_latency','');
+
+  const bkBadge = rwUrl
+    ? (rwOk ? `<span style="padding:1px 7px;border-radius:2px;background:rgba(57,211,83,0.15);border:1px solid var(--green-dim);font-size:9px;font-family:var(--mono);color:var(--green)">● Railway ${rwMs}ms</span>`
+            : `<span style="padding:1px 7px;border-radius:2px;background:rgba(232,184,75,0.12);border:1px solid #6b5010;font-size:9px;font-family:var(--mono);color:var(--yellow)">◌ Railway (untested)</span>`)
+    : efUrl ? `<span style="padding:1px 7px;border-radius:2px;background:rgba(74,158,222,0.15);border:1px solid #1a3a5a;font-size:9px;font-family:var(--mono);color:var(--blue)">◌ Edge Fn</span>`
+            : `<span style="padding:1px 7px;border-radius:2px;background:rgba(224,82,82,0.15);border:1px solid #5a1010;font-size:9px;font-family:var(--mono);color:var(--red)">✗ No backend</span>`;
+
   // Saved field values
   const savedName    = SS.raw('rf_bc_name','');
   const savedEmail   = SS.raw('rf_bc_email_addr','');
@@ -5619,18 +5710,37 @@ function render_commenter(el){
   const liveProxies  = APP.proxies.filter(p=>p.status==='live').length;
 
   el.innerHTML = `
+  <!-- ═══════════ BACKEND WARNING ═══════════ -->
+  ${!hasBackend ? `
+  <div style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px;background:rgba(224,82,82,0.07);border:1px solid #6a1010;border-radius:2px;margin-bottom:10px">
+    <span style="font-size:18px;line-height:1">⚠️</span>
+    <div style="flex:1;font-size:10px;line-height:1.7;color:var(--text2)">
+      <strong style="color:var(--red);font-size:11px">No backend — WordPress comments will silently fail</strong><br>
+      WordPress session-binds its nonce token. When we fetch the page via one CORS proxy and POST via another, WordPress rejects the invalid session and returns a redirect that looks like success — but the comment is never saved.<br>
+      <strong style="color:var(--yellow)">What works WITHOUT a backend:</strong> XML-RPC on WordPress (most sites), form POST on non-WP blogs (Ghost, Blogger, generic).<br>
+      <strong style="color:var(--green)">Full fix:</strong> Deploy the free Railway backend → go to <span onclick="switchPage('settings')" style="color:var(--blue);cursor:pointer;text-decoration:underline">Settings → Railway Backend URL</span>.
+    </div>
+    <button class="tbtn" onclick="switchPage('settings')" style="flex-shrink:0;font-size:9px;padding:2px 8px">⚙ Settings</button>
+  </div>` : (rwUrl && !rwOk ? `
+  <div style="display:flex;gap:8px;align-items:center;padding:7px 10px;background:rgba(232,184,75,0.07);border:1px solid #6b5010;border-radius:2px;margin-bottom:10px;font-size:10px;color:var(--yellow)">
+    ⚠ Railway URL configured but not yet tested — click Test to verify before running.
+    <button class="tbtn" onclick="bc_testRailway()" style="margin-left:auto;font-size:9px;padding:2px 8px">⚡ Test Railway</button>
+  </div>` : '')}
+
   <!-- ═══════════ HEADER BAR ═══════════ -->
-  <div style="display:flex;align-items:center;gap:10px;padding:7px 10px;background:linear-gradient(90deg,rgba(57,211,83,0.08),transparent);border:1px solid var(--win-border);border-radius:2px;margin-bottom:10px">
+  <div style="display:flex;align-items:center;gap:8px;padding:7px 10px;background:linear-gradient(90deg,rgba(57,211,83,0.08),transparent);border:1px solid var(--win-border);border-radius:2px;margin-bottom:10px">
     <span style="font-size:13px;font-weight:700;color:var(--green)">💬 Mass Blog Commenter</span>
-    <span style="font-family:var(--mono);font-size:9px;color:var(--text3)">Fill in your details below → paste URLs → click Start Commenting</span>
+    ${bkBadge}
+    ${rwUrl ? `<button class="tbtn" onclick="bc_testRailway()" style="padding:1px 6px;font-size:9px">⚡ Test</button>` : ''}
     <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
       ${total ? `
-        <span class="badge bg">${success} ✓</span>
-        <span class="badge br">${failed} ✗</span>
-        <span class="badge by">${pending} queued</span>
+        <span class="badge bg">${success} ✓ posted</span>
+        <span class="badge br">${failed} ✗ failed</span>
+        <span class="badge by">${pending} remaining</span>
         <span style="font-family:var(--mono);font-size:10px;color:var(--text3)">${done}/${total}</span>
       ` : '<span style="font-size:10px;color:var(--text3)">No runs yet</span>'}
     </div>
+
   </div>
 
   <!-- ═══════════ MAIN LAYOUT ═══════════ -->
@@ -5810,6 +5920,12 @@ function render_commenter(el){
           style="width:100%;justify-content:center;padding:10px;font-size:13px;font-weight:700;letter-spacing:.02em;border-radius:3px">
           ▶ Start Commenting
         </button>
+        <div style="margin-top:6px;padding:6px 8px;background:var(--win-panel2);border:1px solid var(--win-border);border-radius:2px;font-size:9px;color:var(--text3);line-height:1.7">
+          ${hasBackend
+            ? `<span style="color:var(--green)">✓ Backend ready</span> — Railway/Edge Fn will handle all CMS types with full session support.`
+            : `<span style="color:var(--yellow)">⚠ No backend:</span> XML-RPC will be tried for WordPress (works on most sites). Form POST used for non-WP. <span style="color:var(--red)">WordPress form POST skipped</span> (nonce session mismatch).`
+          }
+        </div>
         ${total && pending > 0 ? `
         <button class="tbtn" onclick="bc_resumeQueue()"
           style="width:100%;justify-content:center;padding:5px;font-size:11px;margin-top:4px">
@@ -6135,6 +6251,32 @@ function bc_exportQueue() {
     'bc_queue_status.csv');
 }
 
+// ── RAILWAY TEST ─────────────────────────────────────────────────────────────
+async function bc_testRailway() {
+  const rwUrl = localStorage.getItem('rf_railway_url') || '';
+  if (!rwUrl) { log('[Railway] No URL configured — go to Settings → Railway Backend URL', 'err'); return; }
+  log('[Railway] Testing connection...', 'info');
+  SS.rawSet('rf_bc_rw_status', 'testing');
+  render_commenter(document.getElementById('page-commenter'));
+  const t0 = Date.now();
+  try {
+    const ok = await RW.test();
+    const ms = Date.now() - t0;
+    if (ok) {
+      SS.rawSet('rf_bc_rw_status', 'ok');
+      SS.rawSet('rf_bc_rw_latency', String(ms));
+      log(`[Railway] ✓ Connected — ${ms}ms`, 'ok');
+    } else {
+      SS.rawSet('rf_bc_rw_status', 'err');
+      log('[Railway] ✗ Reachable but /health returned not-ok', 'err');
+    }
+  } catch(e) {
+    SS.rawSet('rf_bc_rw_status', 'err');
+    log(`[Railway] ✗ ${e.message}`, 'err');
+  }
+  render_commenter(document.getElementById('page-commenter'));
+}
+
 // ── MAIN: START COMMENTING ────────────────────────────────────────────────────
 async function bc_startCommenting() {
   // Read inputs
@@ -6358,50 +6500,77 @@ async function bc_runQueue(toRun, identity) {
     }
     if(capMatch && !captchaKey) log('  [Captcha] Detected — no solver key set', 'warn');
 
-    // Step 4: Post  (Railway → XML-RPC → Form POST)
+    // ── Step 4: Post ──────────────────────────────────────────────────────
+    // Order: Railway → XML-RPC → Form POST (non-WP only without backend)
     let result = { ok: false, method: 'none', reason: 'no_attempt' };
 
-    // Railway (best — server-side, real sessions)
-    if(RW.enabled && (method === 'auto' || method === 'railway_only')) {
+    // 4a. Railway (best: full server-side session, works for all CMS)
+    if (RW.enabled && method !== 'xmlrpc' && method !== 'form') {
       log('  [Railway] posting...', 'info');
       try {
-        const r = await RW.comment({ url: target, authorName: name, authorEmail: emailAddr, authorUrl: website, comment: commentText, method, captchaToken: captchaToken||null });
-        if(r && (r.ok || r.method)) {
+        const r = await RW.comment({ url: target, authorName: name, authorEmail: emailAddr, authorUrl: website, comment: commentText, method, captchaToken: captchaToken || null });
+        if (r && typeof r.ok === 'boolean') {
           result = r;
-          log(`  [Railway] ${result.ok?'✓':'✗'} ${result.reason||''}`, result.ok?'ok':'warn');
+          log(`  [Railway] ${result.ok ? '✓' : '✗'} ${result.reason || ''}`, result.ok ? 'ok' : 'warn');
         }
-      } catch(e) { log(`  [Railway] error: ${e.message} — trying fallback`, 'warn'); }
+      } catch(e) { log(`  [Railway] error: ${e.message}`, 'warn'); }
     }
 
-    // XML-RPC (WordPress only)
-    if(!result.ok && (method==='xmlrpc' || (method==='auto' && cmsInfo.cms==='wordpress'))) {
+    // 4b. XML-RPC (no session/nonce needed — most reliable without backend)
+    //     Try for WordPress, OR if user forced xmlrpc method
+    if (!result.ok && (method === 'xmlrpc' || (method !== 'form' && cmsInfo.cms === 'wordpress'))) {
       log('  [XML-RPC] posting...', 'info');
-      result = await bc_xmlrpcPost(new URL(target).origin, formInfo.postId||'0', { authorName: name, authorEmail: emailAddr, authorUrl: website, content: commentText });
-      log(`  [XML-RPC] ${result.ok?'✓':'✗'} ${result.reason}`, result.ok?'ok':'warn');
+      try {
+        result = await bc_xmlrpcPost(new URL(target).origin, formInfo.postId || '0', { authorName: name, authorEmail: emailAddr, authorUrl: website, content: commentText });
+        log(`  [XML-RPC] ${result.ok ? '✓' : '✗'} ${result.reason}`, result.ok ? 'ok' : 'warn');
+      } catch(e) { log(`  [XML-RPC] threw: ${e.message}`, 'warn'); }
     }
 
-    // Form POST (any CMS)
-    if(!result.ok && (method==='form' || method==='auto')) {
-      log(`  [Form POST] posting to ${cmsInfo.cms}...`, 'info');
-      let actionUrl = formInfo.action || (cmsInfo.cms==='wordpress' ? new URL('/wp-comments-post.php', target).href : target);
-      result = await bc_formPost({ ...formInfo, author: name, email: emailAddr, website, comment: commentText, pageUrl: target }, actionUrl, captchaToken, cmsInfo.cms);
-      log(`  [Form POST] ${result.ok?'✓':'✗'} ${result.reason}`, result.ok?'ok':'warn');
+    // 4c. Form POST
+    //     - With Railway/EdgeFn: any CMS
+    //     - Without backend: non-WordPress only (WP nonces are session-bound)
+    const hasBackend = RW.enabled || !!localStorage.getItem('rf_bc_edge_fn');
+    if (!result.ok && (method === 'form' || method === 'auto')) {
+      if (cmsInfo.cms === 'wordpress' && !hasBackend) {
+        log('  [FormPOST] Skipped for WordPress — nonce requires backend (Railway)', 'warn');
+        if (result.reason === 'no_attempt') result.reason = 'wp_requires_railway';
+      } else {
+        log(`  [FormPOST] posting (${cmsInfo.cms})...`, 'info');
+        const actionUrl = formInfo.action || (cmsInfo.cms === 'wordpress' ? (() => { try { return new URL('/wp-comments-post.php', target).href; } catch { return target; } })() : target);
+        let gfInfo = formInfo;
+        if (!formInfo.action && cmsInfo.cms !== 'wordpress') {
+          const g = bc_extractGenericForm(html, target);
+          if (g.action) gfInfo = { ...formInfo, ...g };
+        }
+        result = await bc_formPost({ ...gfInfo, author: name, email: emailAddr, website, comment: commentText, pageUrl: target }, actionUrl, captchaToken, cmsInfo.cms);
+        log(`  [FormPOST] ${result.ok ? '✓' : '✗'} ${result.reason}`, result.ok ? 'ok' : 'warn');
+      }
     }
 
-    // Step 5: Record result
-    const elapsed = ((Date.now()-t0)/1000).toFixed(1)+'s';
+    // ── Step 5: Record result ─────────────────────────────────────────────
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1) + 's';
     let finalStatus = 'failed', approvalStatus = 'unknown';
-    if(result.ok) {
-      finalStatus    = result.reason==='live' ? 'live' : result.reason==='pending_moderation' ? 'pending_moderation' : 'posted';
-      approvalStatus = result.reason==='live' ? 'approved' : 'pending';
+
+    if (result.ok) {
+      finalStatus    = result.reason === 'live' ? 'live'
+                     : result.reason === 'pending_moderation' ? 'pending_moderation'
+                     : 'posted';
+      approvalStatus = finalStatus === 'live' ? 'approved' : 'pending';
       APP.stats.success++;
-      log(`  ✓ Comment posted! (${result.method} · ${result.reason} · ${elapsed})`, 'ok');
+      log(`  ✓ Comment submitted! method:${result.method} reason:${result.reason} (${elapsed})`, 'ok');
     } else {
       APP.stats.failed++;
-      log(`  ✗ Failed — ${result.reason} (${elapsed})`, 'err');
+      log(`  ✗ Failed: ${result.reason} (${elapsed})`, 'err');
+      // Helpful guidance
+      if (result.reason === 'wp_requires_railway' || result.reason === 'wp_requires_backend_for_session')
+        log('  → To post on WordPress, configure Railway in Settings → Railway Backend URL', 'warn');
+      if (result.reason === 'xmlrpc_disabled')
+        log('  → XML-RPC is disabled on this site. Railway backend required.', 'warn');
+      if (result.reason === 'anon_comments_disabled')
+        log('  → This site requires login to comment (anonymous disabled).', 'warn');
     }
 
-    const record = { target, comment: commentText, name, email: emailAddr, kw, website, status: finalStatus, approvalStatus, cms: cmsInfo.cms, method: result.method, reason: result.reason, commentId: result.commentId||null, date: today(), submittedText: commentText };
+    const record = { target, comment: commentText, name, email: emailAddr, kw, website, status: finalStatus, approvalStatus, cms: cmsInfo.cms, method: result.method, reason: result.reason, commentId: result.commentId || null, date: today(), submittedText: commentText };
     APP.comments.push(record);
     SS.set('rf_comments', APP.comments);
     APP.stats.processed++; updateStats();

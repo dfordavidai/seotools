@@ -1,5 +1,3 @@
-
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6311,6 +6309,7 @@ async function bc_startCommenting() {
   if(!queue.length) { log('Queue is empty after domain-limit filter', 'err'); return; }
 
   log(`▶ Starting — ${queue.length} targets · name: ${name} · website: ${website}`, 'info');
+  APP.running = true; APP.stopFlag = false; // Set BEFORE render so running-state UI is shown
   render_commenter(document.getElementById('page-commenter')); // show running state
   await bc_runQueue(queue, { name, emailAddr, website, commentTxt });
 }
@@ -6329,6 +6328,7 @@ async function bc_resumeQueue() {
     return;
   }
   log(`[Resume] ${remaining.length} remaining items`, 'info');
+  APP.running = true; APP.stopFlag = false; // Set BEFORE render so running-state UI is shown
   render_commenter(document.getElementById('page-commenter'));
   await bc_runQueue(remaining, { name, emailAddr, website, commentTxt });
 }

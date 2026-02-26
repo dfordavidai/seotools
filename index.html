@@ -5206,9 +5206,18 @@ async function camp_run(i){
 
 
 // ═══════════════════════════════════════════════════
-// BLOG COMMENTER — v4.1
-// Real POST · WordPress XML-RPC · Approval Tracking
+// BLOG COMMENTER — v5.0
+// Multi-Proxy POST · WordPress XML-RPC · Generic Forms
+// Blogger · Disqus · Ghost · Approval Tracking
 // ═══════════════════════════════════════════════════
+
+// ── NOTE ON ARCHITECTURE ──────────────────────────────────────────────────────
+// Supabase in this app = key-value DATA STORE only (settings/results sync).
+// HTTP comment posting MUST go through a CORS proxy since browsers block
+// direct cross-origin POSTs. We use a cascade of reliable proxies with
+// automatic fallback. If you want true server-side posting, deploy the
+// Supabase Edge Function shown in the XML-RPC tab and enter its URL in Settings.
+// ─────────────────────────────────────────────────────────────────────────────
 const CNAMES=['Alex Reid','Sarah Chen','Mike Torres','Emma Walsh','David Kim','Lisa Park','James Okafor','Rachel Green','Tom Silva','Nina Patel','John Burke','Maria Costa','Kevin Marsh','Diana Fowler','Chris Anand','Sophie Laurent','Ben Osei','Priya Nair','Luke Hartley','Mia Johansson'];
 
 const CTPLS=[
@@ -5267,66 +5276,194 @@ function bc_extractForm(html, pageUrl) {
   return result;
 }
 
+// ── CORS POST PROXIES ─────────────────────────────────────────────────────────
+// corsproxy.io supports real POST forwarding with response passthrough.
+// allorigins/raw is a fallback but often strips responses. crossorigin.me is tertiary.
+const BC_POST_PROXIES = [
+  { name:'corsproxy.io',    wrap: u => `https://corsproxy.io/?${encodeURIComponent(u)}`,    ct: c => ({'Content-Type':c,'x-requested-with':'XMLHttpRequest'}) },
+  { name:'allorigins/raw',  wrap: u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, ct: c => ({'Content-Type':c}) },
+  { name:'crossorigin.me',  wrap: u => `https://crossorigin.me/${u}`,                        ct: c => ({'Content-Type':c,'X-Requested-With':'XMLHttpRequest'}) },
+];
+
+async function bc_proxyPost(targetUrl, body, contentType='application/x-www-form-urlencoded', timeoutMs=14000) {
+  let lastErr = null;
+  for (const px of BC_POST_PROXIES) {
+    try {
+      const resp = await _origFetch(px.wrap(targetUrl), {
+        method: 'POST',
+        headers: px.ct(contentType),
+        body,
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+      const text = await resp.text();
+      if (text && text.length > 20) return { ok:true, text, proxy:px.name, status:resp.status };
+      lastErr = new Error(`empty from ${px.name}`);
+    } catch(e) { lastErr = e; log(`[Proxy POST] ${px.name} failed: ${e.message}`,'warn'); }
+  }
+  return { ok:false, text:'', proxy:'none', error:lastErr?.message||'all proxies failed' };
+}
+
 // ── WORDPRESS XML-RPC POSTER ─────────────────────────────────────────────────
 async function bc_xmlrpcPost(siteUrl, postId, commentData) {
   const {authorName,authorEmail,authorUrl,content}=commentData;
-  const xmlBody=`<?xml version="1.0"?><methodCall><methodName>wp.newComment</methodName><params><param><value><string>${siteUrl}</string></value></param><param><value><int>0</int></value></param><param><value><string></string></value></param><param><value><int>${postId||1}</int></value></param><param><value><struct><member><name>author</name><value><string>${authorName}</string></value></member><member><name>author_email</name><value><string>${authorEmail}</string></value></member><member><name>author_url</name><value><string>${authorUrl}</string></value></member><member><name>content</name><value><string>${content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</string></value></member></struct></value></param></params></methodCall>`;
-  try{
-    const xmlrpcUrl=new URL('/xmlrpc.php',siteUrl).href;
-    const resp=await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(xmlrpcUrl)}`,{method:'POST',headers:{'Content-Type':'text/xml'},body:xmlBody,signal:AbortSignal.timeout(10000)});
-    const responseText=await resp.text();
-    if(responseText.includes('<fault>')){
-      const faultMsg=responseText.match(/<string>([^<]+)<\/string>/)?.[1]||'XML-RPC fault';
-      const faultCode=responseText.match(/<int>(\d+)<\/int>/)?.[1]||'?';
+  const safe = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const xmlBody=`<?xml version="1.0"?><methodCall><methodName>wp.newComment</methodName><params><param><value><string>${safe(siteUrl)}</string></value></param><param><value><int>0</int></value></param><param><value><string></string></value></param><param><value><int>${postId||1}</int></value></param><param><value><struct><member><n>author</n><value><string>${safe(authorName)}</string></value></member><member><n>author_email</n><value><string>${safe(authorEmail)}</string></value></member><member><n>author_url</n><value><string>${safe(authorUrl)}</string></value></member><member><n>content</n><value><string>${safe(content)}</string></value></member></struct></value></param></params></methodCall>`;
+  try {
+    const xmlrpcUrl = new URL('/xmlrpc.php', siteUrl).href;
+    // Check if user configured a Supabase Edge Function for server-side POSTing
+    const edgeFnUrl = localStorage.getItem('rf_bc_edge_fn');
+    let responseText = '';
+    if (edgeFnUrl) {
+      try {
+        const r = await _origFetch(edgeFnUrl, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({type:'xmlrpc', url:xmlrpcUrl, xml:xmlBody}),
+          signal: AbortSignal.timeout(15000)
+        });
+        const d = await r.json();
+        responseText = d.body || d.text || d.result || '';
+        log(`[XML-RPC] Edge function used ✓`,'ok');
+      } catch(e) {
+        log(`[XML-RPC] Edge function failed (${e.message}), falling back to proxy`,'warn');
+      }
+    }
+    if (!responseText) {
+      const r = await bc_proxyPost(xmlrpcUrl, xmlBody, 'text/xml', 12000);
+      if (!r.ok) return {ok:false,method:'xmlrpc',reason:r.error||'proxy_post_failed'};
+      responseText = r.text;
+      log(`[XML-RPC] via ${r.proxy}`,'info');
+    }
+    if (responseText.includes('<fault>')) {
+      const faultMsg = responseText.match(/<string>([^<]+)<\/string>/)?.[1]||'XML-RPC fault';
+      const faultCode = responseText.match(/<int>(\d+)<\/int>/)?.[1]||'?';
       if(faultCode==='403')return{ok:false,method:'xmlrpc',reason:'xmlrpc_disabled'};
+      if(faultCode==='500')return{ok:false,method:'xmlrpc',reason:'anon_comments_disabled'};
       if(faultCode==='801')return{ok:false,method:'xmlrpc',reason:'duplicate_comment'};
       return{ok:false,method:'xmlrpc',reason:faultMsg};
     }
-    const commentIdMatch=responseText.match(/<int>(\d+)<\/int>/);
+    const commentIdMatch = responseText.match(/<int>(\d+)<\/int>/);
     if(commentIdMatch)return{ok:true,method:'xmlrpc',commentId:commentIdMatch[1],reason:'submitted'};
-    return{ok:false,method:'xmlrpc',reason:'unexpected_response'};
-  }catch(e){return{ok:false,method:'xmlrpc',reason:e.message};}
+    if(responseText.includes('methodResponse'))return{ok:true,method:'xmlrpc',reason:'submitted'};
+    return{ok:false,method:'xmlrpc',reason:'unexpected_xmlrpc_response'};
+  } catch(e) { return{ok:false,method:'xmlrpc',reason:e.message}; }
 }
 
-// ── FORM POST VIA CORS PROXY ─────────────────────────────────────────────────
-async function bc_formPost(formData, actionUrl, captchaToken) {
-  try{
-    const params=new URLSearchParams();
+// ── FORM POST VIA MULTI-PROXY ─────────────────────────────────────────────────
+// Supports: WordPress, Generic HTML forms, Blogger, Ghost, any standard comment form
+async function bc_formPost(formData, actionUrl, captchaToken, cms='generic') {
+  try {
+    if(!actionUrl) return{ok:false,method:'form_post',reason:'no_action_url_found'};
+    const params = new URLSearchParams();
+
+    // WordPress-specific hidden fields
     Object.entries(formData.fields||{}).forEach(([k,v])=>params.append(k,v));
-    if(formData.postId)params.append('comment_post_ID',formData.postId);
-    if(formData.nonce)params.append('_wpnonce',formData.nonce);
-    params.append('author',formData.author||'');
-    params.append('email',formData.email||'');
-    params.append('url',formData.website||'');
-    params.append('comment',formData.comment||'');
-    params.append('submit','Post Comment');
-    params.append('comment_parent','0');
-    if(captchaToken)params.append('g-recaptcha-response',captchaToken);
-    const proxyUrl=`https://api.allorigins.win/raw?url=${encodeURIComponent(actionUrl)}`;
-    const resp=await fetch(proxyUrl,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params.toString(),signal:AbortSignal.timeout(12000)});
-    const respText=await resp.text();
-    if(/duplicate|already said/i.test(respText))return{ok:false,method:'form_post',reason:'duplicate_comment'};
-    if(/spam/i.test(respText))return{ok:false,method:'form_post',reason:'marked_spam'};
-    if(/awaiting.*moderation|held.*moderation/i.test(respText))return{ok:true,method:'form_post',reason:'pending_moderation'};
-    if(/class="comment|comment-\d+|Your comment was/i.test(respText))return{ok:true,method:'form_post',reason:'live'};
-    if(resp.status===302||resp.status===200)return{ok:true,method:'form_post',reason:'submitted'};
-    return{ok:false,method:'form_post',reason:`http_${resp.status}`};
-  }catch(e){return{ok:false,method:'form_post',reason:e.message};}
+    if(formData.postId) params.append('comment_post_ID', formData.postId);
+    if(formData.nonce)  params.append('_wpnonce', formData.nonce);
+
+    // Universal comment form fields (works on WP, generic, Ghost, others)
+    const fieldMap = {
+      // WordPress field names
+      author:  formData.author||'',
+      email:   formData.email||'',
+      url:     formData.website||'',
+      comment: formData.comment||'',
+      submit:  'Post Comment',
+      comment_parent: '0',
+      // Common generic/non-WP field aliases
+      name:       formData.author||'',
+      message:    formData.comment||'',
+      content:    formData.comment||'',
+      body:       formData.comment||'',
+      website:    formData.website||'',
+      homepage:   formData.website||'',
+    };
+
+    // Only append fields that the form actually uses (detected from HTML)
+    const detectedFields = formData.detectedFieldNames || [];
+    if (detectedFields.length > 0) {
+      // Targeted: only send fields the form asked for
+      detectedFields.forEach(fn => {
+        if (fieldMap[fn] !== undefined) params.set(fn, fieldMap[fn]);
+      });
+      // Always include WordPress core fields if WP
+      if(cms==='wordpress') {
+        if(formData.postId) params.set('comment_post_ID', formData.postId);
+        if(formData.nonce)  params.set('_wpnonce', formData.nonce);
+        params.set('submit','Post Comment');
+        params.set('comment_parent','0');
+      }
+    } else {
+      // Fallback: send all common fields
+      Object.entries(fieldMap).forEach(([k,v])=>{ if(v) params.set(k,v); });
+    }
+
+    if(captchaToken) params.append('g-recaptcha-response', captchaToken);
+
+    const r = await bc_proxyPost(actionUrl, params.toString(), 'application/x-www-form-urlencoded', 14000);
+    if (!r.ok) return{ok:false,method:'form_post',reason:r.error||'proxy_post_failed'};
+    const respText = r.text;
+    log(`[Form POST] via ${r.proxy} → ${actionUrl.slice(0,40)}`,'info');
+
+    // Interpret response
+    if(/duplicate|already said|already commented/i.test(respText)) return{ok:false,method:'form_post',reason:'duplicate_comment'};
+    if(/spam|akismet/i.test(respText)) return{ok:false,method:'form_post',reason:'marked_spam'};
+    if(/captcha|are you human|verify/i.test(respText)) return{ok:false,method:'form_post',reason:'captcha_required'};
+    if(/awaiting.*moderation|held.*moderation|moderation queue|thank.*you.*comment|comment.*submitted/i.test(respText)) return{ok:true,method:'form_post',reason:'pending_moderation'};
+    if(/class="comment|comment-\d+|your comment (was|has been)|comment posted|thanks for.*comment/i.test(respText)) return{ok:true,method:'form_post',reason:'live'};
+    if(/error|invalid|required field/i.test(respText)&&!/comment/i.test(respText)) return{ok:false,method:'form_post',reason:'form_validation_error'};
+    // If we got a substantial response and no obvious error, consider it submitted
+    if(r.status===200||r.status===302) return{ok:true,method:'form_post',reason:'submitted'};
+    return{ok:false,method:'form_post',reason:`http_${r.status}`};
+  } catch(e) { return{ok:false,method:'form_post',reason:e.message}; }
+}
+
+// ── GENERIC COMMENT FORM EXTRACTOR (non-WP sites) ────────────────────────────
+function bc_extractGenericForm(html, pageUrl) {
+  const result = {action:null,fields:{},detectedFieldNames:[],method:'POST'};
+  try {
+    // Find all comment-related forms
+    const formMatches = [...html.matchAll(/<form[^>]*(?:comment|respond|reply)[^>]*>([\s\S]*?)<\/form>/gi)];
+    const targetForm = formMatches[0];
+    if (!targetForm) {
+      // Fallback: find any form with a comment/message textarea
+      const allForms = [...html.matchAll(/<form([^>]*)>([\s\S]*?)<\/form>/gi)];
+      for (const fm of allForms) {
+        if (/textarea[^>]*(comment|message|body|content)/i.test(fm[2])) {
+          const actionMatch = fm[1].match(/action="([^"]+)"/i);
+          result.action = actionMatch ? (actionMatch[1].startsWith('http') ? actionMatch[1] : new URL(actionMatch[1],pageUrl).href) : pageUrl;
+          result.detectedFieldNames = [...fm[2].matchAll(/name="([^"]+)"/gi)].map(m=>m[1]);
+          const hiddens = [...fm[2].matchAll(/input[^>]+type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi)];
+          hiddens.forEach(m=>result.fields[m[1]]=m[2]);
+          return result;
+        }
+      }
+      return result;
+    }
+    const formAttrs = targetForm[0];
+    const formBody = targetForm[1] || targetForm[0];
+    const actionMatch = formAttrs.match(/action="([^"]+)"/i);
+    result.action = actionMatch ? (actionMatch[1].startsWith('http') ? actionMatch[1] : new URL(actionMatch[1],pageUrl).href) : pageUrl;
+    result.detectedFieldNames = [...formBody.matchAll(/name="([^"]+)"/gi)].map(m=>m[1]);
+    const hiddens = [...formBody.matchAll(/input[^>]+type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi)];
+    hiddens.forEach(m=>result.fields[m[1]]=m[2]);
+  } catch(e) {}
+  return result;
 }
 
 // ── APPROVAL CHECKER ─────────────────────────────────────────────────────────
 async function bc_checkApproval(comment) {
   if(!comment.target||!comment.submittedText)return'unknown';
-  try{
-    const resp=await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(comment.target)}`,{signal:AbortSignal.timeout(8000)});
-    const data=await resp.json();const html=data.contents||'';
-    const snippet=comment.submittedText.replace(/[{}<>]/g,'').trim().split(/\s+/).slice(3,9).join(' ');
+  try {
+    const html = await bc_proxyGet(comment.target, 10000);
+    if(!html) return 'check_failed';
+    const snippet = comment.submittedText.replace(/[{}<>]/g,'').trim().split(/\s+/).slice(3,9).join(' ');
     if(snippet.length>10&&html.toLowerCase().includes(snippet.toLowerCase()))return'approved';
     if(comment.name&&html.includes(comment.name)&&(html.includes('comment-author')||html.includes('comment-body')))return'approved';
     return'pending';
-  }catch(e){return'check_failed';}
+  } catch(e) { return'check_failed'; }
 }
 
+// ── HELPERS ──────────────────────────────────────────────────────────────────
 // ── HELPERS ──────────────────────────────────────────────────────────────────
 function bc_humanDelay(baseMs){const v=baseMs*0.35;return baseMs+(Math.random()*v*2-v)+rand(0,400);}
 function bc_spin(text){return text.replace(/\{([^{}]+)\}/g,(_,opts)=>{const c=opts.split('|');return c[rand(0,c.length-1)];});}
@@ -5401,7 +5538,7 @@ function render_commenter(el){
               <div class="fg"><label class="lbl">Spin {a|b|c} syntax</label>
                 <select id="bc-spin"><option value="yes">Yes</option><option value="no">No</option></select></div>
             </div>
-            <div class="notice ni-b">Auto mode: detects CMS → tries XML-RPC first on WordPress → falls back to form POST → logs reason for each result.</div>
+            <div class="notice ni-b">Auto mode: detects CMS (WordPress/Generic/Blogger/Ghost/Disqus) → tries XML-RPC first on WP (bypasses form nonces) → falls back to Form POST for all CMSes → uses corsproxy.io / allorigins / crossorigin.me proxy chain automatically → logs result per URL. Works on WordPress and any site with a standard comment form.</div>
             <div class="flex g6 mt8">
               <button class="tbtn go" onclick="start_commenter()">▶ Start</button>
               <button class="tbtn stop" onclick="APP.stopFlag=true;setStatus('Stopping...')">■ Stop</button>
@@ -5524,7 +5661,14 @@ function render_commenter(el){
       <div class="panel">
         <div class="panel-head">🔧 XML-RPC Direct Poster</div>
         <div class="panel-body">
-          <div class="notice ni-y" style="margin-bottom:8px">Posts directly to <code>/xmlrpc.php</code> — bypasses comment form entirely. Works on most WordPress installs unless explicitly disabled. Anonymous comments must be enabled in WP Discussion settings.</div>
+          <div class="notice ni-y" style="margin-bottom:8px">Posts directly to <code>/xmlrpc.php</code> — bypasses comment form entirely. Works on most WordPress installs unless explicitly disabled. Anonymous comments must be enabled in WP Settings → Discussion.</div>
+          <div class="notice ni-b" style="margin-bottom:8px">
+            <strong style="color:var(--yellow)">ℹ Supabase in this app = data sync only</strong> — it stores your results/settings, not execute HTTP requests. For true server-side comment posting (no CORS limits), deploy a Supabase Edge Function and paste the URL below. Otherwise the app uses corsproxy.io → allorigins → crossorigin.me fallback chain automatically.
+          </div>
+          <div class="fg"><label class="lbl">Supabase Edge Function URL <span style="color:var(--text3);font-weight:normal">(optional — for server-side posting, bypasses all CORS)</span></label>
+            <input type="url" id="bc-edge-fn" placeholder="https://xxxx.supabase.co/functions/v1/comment-poster" value="${localStorage.getItem('rf_bc_edge_fn')||''}" oninput="localStorage.setItem('rf_bc_edge_fn',this.value);log('Edge function URL saved','ok')"/>
+          </div>
+          <div style="margin-bottom:8px;font-size:10px;color:var(--text3);line-height:1.7">Edge function receives: <code style="color:var(--cyan)">{ type:'xmlrpc'|'form', url, xml|body }</code> and should return <code style="color:var(--cyan)">{ body: '...' }</code>. Deploy from the Supabase dashboard → Edge Functions.</div>
           <div class="fg"><label class="lbl">Target WordPress Post URL</label><input type="url" id="xrpc-target" placeholder="https://example.com/2024/01/some-post/"/></div>
           <div class="fg"><label class="lbl">Post ID (0 = auto-detect from page HTML)</label><input type="number" id="xrpc-postid" value="0" min="0"/></div>
           <div class="g2">
@@ -5623,30 +5767,37 @@ async function start_commenter(){
     const proxy=useProxy?getNextProxy():null;
     if(proxy)log(`[Proxy] ${proxyLabel(proxy)} → ${target.slice(0,35)}`,'info');
 
-    // Step 1: Fetch and detect
+    // Step 1: Fetch target page and detect CMS
     let html='',cmsInfo={cms:'unknown',confidence:'low',signals:[]};
     try{
-      const resp=await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(target)}`,{signal:AbortSignal.timeout(8000)});
-      const data=await resp.json();html=data.contents||'';
+      // Use the multi-proxy GET chain (already handles allorigins + corsproxy.io + codetabs + thingproxy fallback)
+      html = await bc_proxyGet(target, 12000);
+      if(!html) throw new Error('empty response from all proxies');
       cmsInfo=bc_detectCMS(html,target);
-      log(`[Detect] ${target.slice(0,35)} → ${cmsInfo.cms} (${cmsInfo.confidence})`,cmsInfo.cms!=='unknown'?'ok':'warn');
+      log(`[Detect] ${target.slice(0,40)} → ${cmsInfo.cms} (${cmsInfo.confidence})`,cmsInfo.cms!=='unknown'?'ok':'warn');
     }catch(e){
-      log(`[Detect] ${target.slice(0,35)} → fetch failed: ${e.message}`,'err');
-      APP.comments.push({target,comment,name,email,website:websiteField,status:'failed',cms:'unknown',method:'failed',reason:'fetch_error',date:today(),submittedText:comment,approvalStatus:'unknown'});
+      log(`[Detect] ${target.slice(0,40)} → fetch failed: ${e.message}`,'err');
+      APP.comments.push({target,comment,name,email,website:websiteField,status:'failed',cms:'unknown',method:'failed',reason:'fetch_error: '+e.message,date:today(),submittedText:comment,approvalStatus:'unknown'});
       APP.stats.failed++;APP.stats.processed++;updateStats();
       await sleep(useVariance?bc_humanDelay(baseDelay):baseDelay);
       continue;
     }
 
-    const formInfo=bc_extractForm(html,target);
+    // Extract form fields: WordPress-aware extractor + generic extractor
+    let formInfo=bc_extractForm(html,target);
+    // If WP extractor didn't find an action and this isn't WP, use generic extractor
+    if(!formInfo.action&&cmsInfo.cms!=='wordpress'){
+      const genForm=bc_extractGenericForm(html,target);
+      if(genForm.action) formInfo={...formInfo,...genForm};
+    }
 
     if(isDryRun){
-      log(`[DryRun] postId:${formInfo.postId||'?'} nonce:${formInfo.nonce?'✓':'✗'} action:${formInfo.action?formInfo.action.slice(0,40):'?'}`,'info');
+      log(`[DryRun] cms:${cmsInfo.cms} postId:${formInfo.postId||'?'} nonce:${formInfo.nonce?'✓':'✗'} action:${formInfo.action?formInfo.action.slice(0,45):'?'} fields:[${(formInfo.detectedFieldNames||[]).slice(0,6).join(',')}]`,'info');
       APP.comments.push({target,comment,name,email,website:websiteField,status:'detected_only',cms:cmsInfo.cms,method:'detect',reason:'dry_run',date:today(),submittedText:comment,approvalStatus:'unknown'});
       APP.stats.processed++;updateStats();await sleep(500);continue;
     }
 
-    // Step 2: Captcha
+    // Step 2: Captcha detection
     let captchaToken=null;
     const capMatch=html.match(/data-sitekey="([^"]+)"/);
     if(capMatch&&captchaKey){
@@ -5654,20 +5805,32 @@ async function start_commenter(){
       captchaToken=await solveCaptcha(capMatch[1],target);
       if(captchaToken)log('[Captcha] Token ✓','ok');
     }
+    if(capMatch&&!captchaKey){
+      log(`[Captcha] reCAPTCHA detected but no 2captcha key set — may fail`,'warn');
+    }
 
-    // Step 3: Post
+    // Step 3: Post — Strategy based on CMS and method setting
     let result={ok:false,method:'none',reason:'no_attempt'};
     const tryXmlrpc=method==='xmlrpc'||(method==='auto'&&cmsInfo.cms==='wordpress');
     const tryForm=method==='form'||method==='auto';
 
+    // WordPress: try XML-RPC first (bypasses nonce/session issues entirely)
     if(tryXmlrpc&&cmsInfo.cms==='wordpress'){
-      log(`[XML-RPC] → ${target.slice(0,35)}`,'info');
+      log(`[XML-RPC] → ${target.slice(0,40)}`,'info');
       result=await bc_xmlrpcPost(new URL(target).origin,formInfo.postId||'0',{authorName:name,authorEmail:email,authorUrl:websiteField,content:comment});
       log(`[XML-RPC] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
     }
-    if(!result.ok&&tryForm&&result.reason!=='xmlrpc_only'){
-      log(`[Form POST] → ${target.slice(0,35)}`,'info');
-      result=await bc_formPost({...formInfo,author:name,email,website:websiteField,comment},formInfo.action||new URL('/wp-comments-post.php',target).href,captchaToken);
+
+    // Form POST fallback — works for WordPress AND all other CMSes
+    if(!result.ok&&tryForm){
+      log(`[Form POST] cms:${cmsInfo.cms} → ${target.slice(0,40)}`,'info');
+      // Determine action URL based on CMS
+      let actionUrl=formInfo.action;
+      if(!actionUrl){
+        if(cmsInfo.cms==='wordpress') actionUrl=new URL('/wp-comments-post.php',target).href;
+        else actionUrl=target; // POST back to the page itself (common for generic blogs)
+      }
+      result=await bc_formPost({...formInfo,author:name,email,website:websiteField,comment},actionUrl,captchaToken,cmsInfo.cms);
       log(`[Form POST] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
     }
 
@@ -5732,10 +5895,9 @@ async function bc_xmlrpcTest(){
   let pid=postId;
   if(!pid||pid==='0'){
     try{
-      const resp=await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(target)}`,{signal:AbortSignal.timeout(8000)});
-      const data=await resp.json();const html=data.contents||'';
+      const html=await bc_proxyGet(target,10000);
       const m=html.match(/name="comment_post_ID"\s+value="(\d+)"/i)||html.match(/comment_post_ID[^>]*value="(\d+)"/i);
-      if(m)pid=m[1];
+      if(m){pid=m[1];log(`[XML-RPC Test] Auto-detected post ID: ${pid}`,'info');}
     }catch(e){}
   }
   log(`[XML-RPC Test] Target: ${target} PostID: ${pid||'unknown'}`,'info');
@@ -5756,16 +5918,17 @@ async function bc_xmlrpcProbeUrl(overrideUrl){
   log(`[XML-RPC Probe] ${url}`,'info');
   try{
     const origin=new URL(url).origin;const xmlrpcUrl=origin+'/xmlrpc.php';
-    const resp=await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(xmlrpcUrl)}`,{signal:AbortSignal.timeout(8000)});
-    const data=await resp.json();const body=data.contents||'';
-    const xmlrpcEnabled=body.includes('XML-RPC server accepts POST requests only')||body.includes('xmlrpc');
+    // GET probe to check if xmlrpc.php responds
+    const body=await bc_proxyGet(xmlrpcUrl,10000);
+    const xmlrpcEnabled=body.includes('XML-RPC server accepts POST requests only')||body.includes('xmlrpc')||body.includes('methodResponse');
     const methodsXml=`<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>`;
     let methods=[];
     try{
-      const r2=await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(xmlrpcUrl)}`,{method:'POST',headers:{'Content-Type':'text/xml'},body:methodsXml,signal:AbortSignal.timeout(8000)});
-      const t2=await r2.text();
-      const mm=t2.match(/<string>(wp\.[^<]+)<\/string>/g)||[];
-      methods=mm.map(m=>m.replace(/<\/?string>/g,''));
+      const r2=await bc_proxyPost(xmlrpcUrl,methodsXml,'text/xml',10000);
+      if(r2.ok){
+        const mm=r2.text.match(/<string>(wp\.[^<]+)<\/string>/g)||[];
+        methods=mm.map(m=>m.replace(/<\/?string>/g,''));
+      }
     }catch(e){}
     const hasComment=methods.includes('wp.newComment');
     const output=[

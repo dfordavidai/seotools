@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -652,6 +651,67 @@ async function sbStatus() {
     return error ? 'error: ' + error.message : 'connected';
   } catch(e) { return 'error: ' + e.message; }
 }
+
+// ═══════════════════════════════════════════════════
+// RAILWAY BACKEND — Server-side HTTP execution engine
+// ═══════════════════════════════════════════════════
+// Supabase = data storage (settings/results/URL lists)
+// Railway  = HTTP execution (real requests, cookies, sessions, no CORS)
+
+const RW = {
+  get url() { return localStorage.getItem('rf_railway_url') || ''; },
+  set url(v) { localStorage.setItem('rf_railway_url', v.replace(/\/$/, '')); },
+  get enabled() { return !!this.url; },
+
+  // Core fetch — routes through Railway backend
+  async fetch(endpoint, body, timeoutMs=20000) {
+    const base = this.url;
+    if (!base) throw new Error('Railway URL not configured');
+    const resp = await _origFetch(`${base}${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!resp.ok) throw new Error(`Railway HTTP ${resp.status}`);
+    return resp.json();
+  },
+
+  // GET endpoint
+  async get(endpoint, timeoutMs=10000) {
+    const base = this.url;
+    if (!base) throw new Error('Railway URL not configured');
+    const resp = await _origFetch(`${base}${endpoint}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return resp.json();
+  },
+
+  // Fetch a page server-side (replaces allorigins for GET requests)
+  async fetchPage(url, timeoutMs=20000) {
+    const r = await this.fetch('/fetch', { url, method: 'GET', timeout: timeoutMs }, timeoutMs + 2000);
+    if (!r.ok) throw new Error(r.error || 'fetch failed');
+    return r.html || '';
+  },
+
+  // Post a comment server-side (full cookie/nonce flow)
+  async comment(params) {
+    return this.fetch('/comment', params, 25000);
+  },
+
+  // Health check
+  async test() {
+    try {
+      const r = await this.get('/health', 8000);
+      return r.ok === true;
+    } catch(e) { return false; }
+  },
+};
+
+// Override prx_corsGet and bc_proxyGet to use Railway when configured
+// This means ALL tools automatically use Railway once the URL is set
+const _origPrxCorsGet = window.prx_corsGet;
+
 
 const SS = {
   get(k, def=null){ try{ const v=localStorage.getItem(k); return v?JSON.parse(v):def; }catch(e){ return def; } },
@@ -5318,11 +5378,11 @@ async function bc_xmlrpcPost(siteUrl, postId, commentData) {
         const r = await _origFetch(edgeFnUrl, {
           method:'POST', headers:{'Content-Type':'application/json'},
           body: JSON.stringify({type:'xmlrpc', url:xmlrpcUrl, xml:xmlBody}),
-          signal: AbortSignal.timeout(15000)
+          signal: AbortSignal.timeout(20000)
         });
         const d = await r.json();
         responseText = d.body || d.text || d.result || '';
-        log(`[XML-RPC] Edge function used ✓`,'ok');
+        log(`[XML-RPC] Edge function ✓ (server-side)`,'ok');
       } catch(e) {
         log(`[XML-RPC] Edge function failed (${e.message}), falling back to proxy`,'warn');
       }
@@ -5399,9 +5459,52 @@ async function bc_formPost(formData, actionUrl, captchaToken, cms='generic') {
 
     if(captchaToken) params.append('g-recaptcha-response', captchaToken);
 
+    const edgeFnUrl = localStorage.getItem('rf_bc_edge_fn');
+    let respText = '';
+    if (edgeFnUrl) {
+      // Route through Supabase Edge Function — full server-side session-aware POST
+      // The edge function does: GET page (session+cookies+nonce) → POST comment — all server-side
+      try {
+        const efPayload = {
+          type: cms === 'wordpress' ? 'wp_comment' : 'form_comment',
+          pageUrl: formData.pageUrl || actionUrl, // pageUrl = original post URL for session fetch
+          actionUrl: actionUrl,
+          // For wp_comment, pass individual fields — edge fn builds the form
+          author: formData.author || '',
+          email: formData.email || '',
+          website: formData.website || '',
+          comment: formData.comment || '',
+          // For form_comment, pass all fields as-is
+          fields: {
+            ...formData.fields,
+            author: formData.author||'', name: formData.author||'',
+            email: formData.email||'',
+            url: formData.website||'', website: formData.website||'',
+            comment: formData.comment||'', message: formData.comment||'', content: formData.comment||'',
+          }
+        };
+        const r = await _origFetch(edgeFnUrl, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(efPayload),
+          signal: AbortSignal.timeout(25000)
+        });
+        const d = await r.json();
+        log(`[Form POST] Edge function ✓ (server-side) → ${d.reason}`,'ok');
+        if (d.reason === 'duplicate_comment') return{ok:false,method:'form_post',reason:'duplicate_comment'};
+        if (d.reason === 'marked_spam') return{ok:false,method:'form_post',reason:'marked_spam'};
+        if (d.reason === 'captcha_required') return{ok:false,method:'form_post',reason:'captcha_required'};
+        if (d.reason === 'nonce_invalid') return{ok:false,method:'form_post',reason:'nonce_invalid'};
+        if (d.ok) return{ok:true,method:'form_post',reason:d.reason||'submitted'};
+        return{ok:false,method:'form_post',reason:d.reason||'edge_fn_failed'};
+      } catch(e) {
+        log(`[Form POST] Edge function failed (${e.message}), falling back to proxy`,'warn');
+      }
+    }
+    // Fallback: browser-side proxy chain (less reliable for modern WP)
     const r = await bc_proxyPost(actionUrl, params.toString(), 'application/x-www-form-urlencoded', 14000);
     if (!r.ok) return{ok:false,method:'form_post',reason:r.error||'proxy_post_failed'};
-    const respText = r.text;
+    respText = r.text;
     log(`[Form POST] via ${r.proxy} → ${actionUrl.slice(0,40)}`,'info');
 
     // Interpret response
@@ -5481,79 +5584,137 @@ function bc_clearLog(){if(!confirm('Clear all comment history?'))return;APP.comm
 // ── RENDER ───────────────────────────────────────────────────────────────────
 function render_commenter(el){
   const templates=SS.get('rf_ctpls',CTPLS);
-  const posted=APP.comments.filter(c=>['posted','pending_moderation','live'].includes(c.status)).length;
-  const failed=APP.comments.filter(c=>c.status==='failed').length;
-  const pending=APP.comments.filter(c=>c.approvalStatus==='pending').length;
-  const approved=APP.comments.filter(c=>c.approvalStatus==='approved').length;
+  const allComments=APP.comments;
+  const posted=allComments.filter(c=>['posted','pending_moderation','live'].includes(c.status)).length;
+  const failed=allComments.filter(c=>c.status==='failed').length;
+  const pending=allComments.filter(c=>c.approvalStatus==='pending').length;
+  const approved=allComments.filter(c=>c.approvalStatus==='approved').length;
   const activeTab=SS.raw('rf_commenter_tab')||'config';
+  const queue=SS.get('rf_bc_queue',[]);
+  const qDone=queue.filter(q=>q.done).length;
+  const qTotal=queue.length;
+  const edgeFn=localStorage.getItem('rf_bc_edge_fn')||'';
+
   el.innerHTML=`
+  <!-- Mass Backlink Commenter Header -->
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:8px 10px;background:linear-gradient(90deg,rgba(57,211,83,0.07),transparent);border:1px solid var(--win-border);border-radius:2px">
+    <span style="font-size:13px;font-weight:700;color:var(--green)">💬 Mass Blog Commenter</span>
+    <span style="font-size:10px;color:var(--text3)">— Post backlink comments to any blog, WordPress or non-WP, at scale</span>
+    <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+      <span class="badge bg">${posted} posted</span>
+      <span class="badge br">${failed} failed</span>
+      <span class="badge by">${pending} pending</span>
+      <span class="badge bg" style="background:rgba(57,211,83,0.2)">${approved} live</span>
+      ${qTotal?`<span class="badge bgray">${qDone}/${qTotal} queue</span>`:''}
+    </div>
+  </div>
+
   <div style="display:flex;gap:0;border-bottom:2px solid var(--win-border);margin-bottom:10px">
-    ${[['config','⚙ Config'],['monitor','📡 Monitor'],['templates','✍ Templates'],['xmlrpc','🔧 XML-RPC']].map(([id,label])=>`
+    ${[['config','⚙ Config'],['queue','📋 Queue ('+qTotal+')'],['monitor','📡 Monitor'],['templates','✍ Templates'],['xmlrpc','🔧 XML-RPC / Proxy']].map(([id,label])=>`
     <div onclick="SS.rawSet('rf_commenter_tab','${id}');render_commenter(document.getElementById('page-commenter'))"
       style="padding:5px 14px;font-size:11px;font-weight:700;cursor:pointer;border-bottom:2px solid ${activeTab===id?'var(--green)':'transparent'};margin-bottom:-2px;color:${activeTab===id?'var(--green)':'var(--text3)'};background:${activeTab===id?'rgba(57,211,83,0.05)':'transparent'}">${label}</div>`).join('')}
   </div>
 
+  <!-- ═══ CONFIG TAB ═══ -->
   <div style="display:${activeTab==='config'?'block':'none'}">
     <div class="g2">
       <div>
         <div class="panel">
-          <div class="panel-head">💬 Commenter Config
-            <div class="ph-r"><span class="badge bg">${posted} submitted</span><span class="badge by">${pending} pending</span><span class="badge bg" style="background:rgba(57,211,83,0.15)">${approved} live</span></div>
-          </div>
+          <div class="panel-head">🎯 Backlink Target & Comment Settings</div>
           <div class="panel-body">
             <div class="g2">
-              <div class="fg"><label class="lbl">Money URL</label><input type="url" id="bc-url" placeholder="https://yoursite.com"/></div>
-              <div class="fg"><label class="lbl">Website / Backlink Field</label><input type="url" id="bc-website" placeholder="https://yoursite.com"/></div>
+              <div class="fg"><label class="lbl">💰 Money URL <span style="color:var(--text3);font-weight:normal">(your site getting the backlinks)</span></label>
+                <input type="url" id="bc-url" placeholder="https://yoursite.com" value="${esc(SS.raw('rf_bc_moneyurl'))||''}" oninput="SS.rawSet('rf_bc_moneyurl',this.value)"/></div>
+              <div class="fg"><label class="lbl">🔗 Website Field URL <span style="color:var(--text3);font-weight:normal">(in comment author box, usually same)</span></label>
+                <input type="url" id="bc-website" placeholder="https://yoursite.com" value="${esc(SS.raw('rf_bc_website'))||''}" oninput="SS.rawSet('rf_bc_website',this.value)"/></div>
             </div>
-            <div class="fg"><label class="lbl">Anchor / Keyword</label><input type="text" id="bc-kw" placeholder="best VPN 2025"/></div>
-            <div class="fg"><label class="lbl">Target URLs</label>
-              <textarea id="bc-targets" rows="5" placeholder="Paste blog post URLs here...">${APP.urlList.slice(0,200).join('\n')}</textarea></div>
-            <button class="tbtn" style="margin-bottom:8px" onclick="bc_loadList()">📋 Load URL List (${APP.urlList.length})</button>
+
+            <div class="fg" style="margin-top:6px">
+              <label class="lbl">🔑 Anchor Keywords <span style="color:var(--text3);font-weight:normal">(one per line — rotated per comment for variety)</span></label>
+              <textarea id="bc-kw" rows="3" placeholder="best VPN 2025&#10;top VPN service&#10;VPN review" oninput="SS.set('rf_bc_kws',this.value.split('\\n').filter(Boolean))">${(SS.get('rf_bc_kws',[])||[]).join('\\n')||SS.raw('rf_bc_kw')||''}</textarea>
+            </div>
+
+            <div class="fg" style="margin-top:6px">
+              <label class="lbl">📋 Target URLs <span style="color:var(--text3);font-weight:normal">(paste blog post URLs, one per line — unlimited)</span></label>
+              <textarea id="bc-targets" rows="8" placeholder="https://example.com/blog-post-1&#10;https://anotherblog.com/article&#10;https://wordpress-site.com/post&#10;...">${APP.urlList.slice(0,5000).join('\\n')}</textarea>
+              <div style="display:flex;gap:6px;margin-top:4px;align-items:center;flex-wrap:wrap">
+                <button class="tbtn" onclick="bc_loadList()">📋 Load URL List (${APP.urlList.length})</button>
+                <button class="tbtn" onclick="bc_pasteFromClipboard()">📌 Paste from Clipboard</button>
+                <button class="tbtn" onclick="bc_importTxt()">📂 Import TXT file</button>
+                <span id="bc-url-count" class="mono xs tm" style="color:var(--text3)"></span>
+                <button class="tbtn" style="margin-left:auto" onclick="bc_dedupeTargets()">🔀 Dedupe URLs</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:8px">
+          <div class="panel-head">⚙ Posting Options</div>
+          <div class="panel-body">
             <div class="g3">
               <div class="fg"><label class="lbl">Post Method</label>
                 <select id="bc-method">
                   <option value="auto">Auto (XML-RPC → Form fallback)</option>
                   <option value="form">Form POST only</option>
-                  <option value="xmlrpc">XML-RPC only</option>
+                  <option value="xmlrpc">XML-RPC only (WP)</option>
                   <option value="detect">Detect Only (dry run)</option>
                 </select></div>
               <div class="fg"><label class="lbl">Comment Style</label>
-                <select id="bc-style"><option value="natural">Natural</option><option value="expert">Expert</option><option value="question">Question</option><option value="compliment">Compliment</option><option value="mixed">Mixed</option></select></div>
-              <div class="fg"><label class="lbl">Commenter Name</label><input type="text" id="bc-name" placeholder="Random if blank"/></div>
+                <select id="bc-style"><option value="mixed">Mixed (recommended)</option><option value="natural">Natural</option><option value="expert">Expert</option><option value="question">Question</option><option value="compliment">Compliment</option></select></div>
+              <div class="fg"><label class="lbl">Commenter Name</label>
+                <input type="text" id="bc-name" placeholder="Random from list if blank"/></div>
             </div>
             <div class="g3">
-              <div class="fg"><label class="lbl">Delay (ms)</label><input type="number" id="bc-delay" value="2000" min="500"/></div>
+              <div class="fg"><label class="lbl">Delay Between Posts (ms)</label>
+                <input type="number" id="bc-delay" value="${SS.raw('rf_bc_delay')||'3000'}" min="500" oninput="SS.rawSet('rf_bc_delay',this.value)"/></div>
               <div class="fg"><label class="lbl">Human Timing Variance</label>
                 <select id="bc-variance"><option value="yes">Yes (±35% + jitter)</option><option value="no">No (fixed)</option></select></div>
-              <div class="fg"><label class="lbl">Use Proxies</label>
-                <select id="bc-proxy"><option value="yes">Yes (${APP.proxies.filter(p=>p.status==='live').length} live)</option><option value="no">No</option></select></div>
+              <div class="fg"><label class="lbl">Max Comments per Domain</label>
+                <input type="number" id="bc-maxperdomain" value="${SS.raw('rf_bc_maxperdomain')||'3'}" min="1" max="50" oninput="SS.rawSet('rf_bc_maxperdomain',this.value)"
+                  title="Limits how many comments get posted to same root domain. Prevents over-concentration."/></div>
             </div>
-            <div class="g2">
+            <div class="g3">
               <div class="fg"><label class="lbl">Email Pattern</label>
                 <select id="bc-email">
                   <option value="firstlast99">firstlast99@domain.com</option>
                   <option value="firstname.lastname">firstname.lastname@domain.com</option>
                   <option value="firstlast">firstlast@domain.com</option>
                 </select></div>
-              <div class="fg"><label class="lbl">Spin {a|b|c} syntax</label>
+              <div class="fg"><label class="lbl">Spin {a|b} Syntax</label>
                 <select id="bc-spin"><option value="yes">Yes</option><option value="no">No</option></select></div>
+              <div class="fg"><label class="lbl">Use Proxies</label>
+                <select id="bc-proxy"><option value="yes">Yes (${APP.proxies.filter(p=>p.status==='live').length} live)</option><option value="no">No</option></select></div>
             </div>
-            <div class="notice ni-b">Auto mode: detects CMS (WordPress/Generic/Blogger/Ghost/Disqus) → tries XML-RPC first on WP (bypasses form nonces) → falls back to Form POST for all CMSes → uses corsproxy.io / allorigins / crossorigin.me proxy chain automatically → logs result per URL. Works on WordPress and any site with a standard comment form.</div>
-            <div class="flex g6 mt8">
-              <button class="tbtn go" onclick="start_commenter()">▶ Start</button>
-              <button class="tbtn stop" onclick="APP.stopFlag=true;setStatus('Stopping...')">■ Stop</button>
-              <button class="tbtn" onclick="bc_preview()">👁 Preview</button>
-              <button class="tbtn" onclick="bc_export()">📥 Export</button>
-              <button class="tbtn" onclick="bc_clearLog()">🗑 Clear Log</button>
+            <div class="fg">
+              <label class="lbl">Batch Size <span style="color:var(--text3);font-weight:normal">(URLs per run — resume supported, 0 = all)</span></label>
+              <input type="number" id="bc-batchsize" value="${SS.raw('rf_bc_batchsize')||'0'}" min="0" oninput="SS.rawSet('rf_bc_batchsize',this.value)"/>
             </div>
-            <div class="prog-wrap"><div class="prog-fill" id="bc-prog"></div></div>
           </div>
         </div>
-        <div id="bc-preview-panel" style="display:none" class="panel">
-          <div class="panel-head">👁 Previews</div>
+
+        <div class="notice ni-b" style="margin-top:8px">
+          <strong style="color:var(--green)">How it works:</strong> Detects CMS (WP/Generic/Blogger/Ghost/Disqus) → XML-RPC first on WordPress (bypasses nonce issues) → Form POST fallback for any CMS → posts through corsproxy.io → allorigins → crossorigin.me proxy chain → tracks every result with resume support.
+        </div>
+
+        <div class="flex g6 mt8" style="flex-wrap:wrap">
+          <button class="tbtn go" onclick="bc_buildQueueAndStart()">▶ Build Queue &amp; Start</button>
+          <button class="tbtn go" style="background:linear-gradient(180deg,#1a5a7a,#0e3a5a);border-color:#0e3a5a;color:#7dddff" onclick="bc_resumeQueue()">⏩ Resume Queue</button>
+          <button class="tbtn stop" onclick="APP.stopFlag=true;setStatus('Stopping...')">■ Stop</button>
+          <button class="tbtn" onclick="bc_preview()">👁 Preview Comments</button>
+          <button class="tbtn" onclick="bc_export()">📥 Export CSV</button>
+          <button class="tbtn stop" onclick="bc_clearLog()">🗑 Clear Results</button>
+          <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
+            <div class="prog-wrap" style="width:160px"><div class="prog-fill" id="bc-prog"></div></div>
+            <span id="bc-prog-label" class="mono xs tm" style="color:var(--text3)"></span>
+          </div>
+        </div>
+
+        <div id="bc-preview-panel" style="display:none;margin-top:8px" class="panel">
+          <div class="panel-head">👁 Comment Previews</div>
           <div class="panel-body" id="bc-preview-body"></div>
         </div>
       </div>
+
       <div>
         <div class="panel">
           <div class="panel-head">📊 Stats</div>
@@ -5564,22 +5725,29 @@ function render_commenter(el){
               <div class="stat"><div class="stat-v sv-y">${pending}</div><div class="stat-l">Pending Mod</div></div>
               <div class="stat"><div class="stat-v sv-b">${approved}</div><div class="stat-l">Confirmed Live</div></div>
             </div>
+            ${qTotal?`<div style="margin-bottom:8px">
+              <div class="mono xs tm" style="margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em">Queue Progress</div>
+              <div style="height:10px;background:var(--win-panel2);border:1px solid var(--win-border2);border-radius:2px;overflow:hidden;margin-bottom:4px">
+                <div style="height:100%;width:${qTotal?Math.round(qDone/qTotal*100):0}%;background:linear-gradient(90deg,var(--green-dim),var(--green))"></div>
+              </div>
+              <div class="mono xs tm" style="color:var(--text3)">${qDone}/${qTotal} done · ${qTotal-qDone} remaining</div>
+            </div>`:''}
             <div class="mono xs tm" style="margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em">By Method</div>
-            ${['xmlrpc','form_post','detect','failed'].map(m=>{const n=APP.comments.filter(c=>c.method===m).length;return n?`<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;padding:2px 0;border-bottom:1px solid var(--win-border)"><span style="color:var(--text2)">${m.replace('_',' ')}</span><span class="badge bgray">${n}</span></div>`:'';}).join('')}
+            ${['xmlrpc','form_post','detect','failed'].map(m=>{const n=allComments.filter(c=>c.method===m).length;return n?`<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;padding:2px 0;border-bottom:1px solid var(--win-border)"><span style="color:var(--text2)">${m.replace('_',' ')}</span><span class="badge bgray">${n}</span></div>`:''}).join('')}
             <div class="mono xs tm" style="margin:8px 0 4px;text-transform:uppercase;letter-spacing:.04em">By CMS</div>
-            ${['wordpress','blogger','ghost','disqus','generic','unknown'].map(cms=>{const n=APP.comments.filter(c=>c.cms===cms).length;return n?`<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;padding:2px 0;border-bottom:1px solid var(--win-border)"><span style="color:var(--text2)">${cms}</span><span class="badge ${cms==='wordpress'?'bg':'bgray'}">${n}</span></div>`:'';}).join('')}
+            ${['wordpress','blogger','ghost','disqus','generic','unknown'].map(cms=>{const n=allComments.filter(c=>c.cms===cms).length;return n?`<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;padding:2px 0;border-bottom:1px solid var(--win-border)"><span style="color:var(--text2)">${cms}</span><span class="badge ${cms==='wordpress'?'bg':'bgray'}">${n}</span></div>`:''}).join('')}
           </div>
         </div>
         <div class="panel" style="margin-top:8px">
           <div class="panel-head">Recent Activity
             <div class="ph-r"><button class="tbtn" style="padding:1px 6px;font-size:9px" onclick="bc_clearLog()">Clear</button></div>
           </div>
-          <div style="padding:0;max-height:260px;overflow-y:auto">
-            ${APP.comments.length?APP.comments.slice(-25).reverse().map(c=>`
+          <div style="padding:0;max-height:320px;overflow-y:auto">
+            ${allComments.length?allComments.slice(-30).reverse().map(c=>`
               <div style="padding:5px 8px;border-bottom:1px solid #1a1a1a;display:flex;align-items:flex-start;gap:8px">
                 <span class="badge ${['posted','live','pending_moderation'].includes(c.status)?'bg':c.status==='failed'?'br':'by'}" style="flex-shrink:0;margin-top:1px;font-size:8px">${c.status}</span>
                 <div style="flex:1;min-width:0">
-                  <div class="mono xs" style="color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.target.replace(/https?:\/\//,'').slice(0,42))}</div>
+                  <div class="mono xs" style="color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.target.replace(/https?:\/\//,'').slice(0,45))}</div>
                   <div style="font-size:9px;color:var(--text3);margin-top:1px">${esc(c.name)} · ${c.cms||'?'} · ${c.method||'?'} · ${c.reason||''}${c.approvalStatus==='approved'?' · <span style="color:var(--green)">✓ LIVE</span>':''}</div>
                 </div>
               </div>`).join('')
@@ -5590,6 +5758,42 @@ function render_commenter(el){
     </div>
   </div>
 
+  <!-- ═══ QUEUE TAB ═══ -->
+  <div style="display:${activeTab==='queue'?'block':'none'}">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+      <span style="font-size:11px;color:var(--text2)">${qTotal} URLs in queue · ${qDone} done · ${qTotal-qDone} remaining</span>
+      <button class="tbtn go" style="padding:2px 8px;font-size:10px" onclick="bc_resumeQueue()">⏩ Resume</button>
+      <button class="tbtn stop" style="padding:2px 8px;font-size:10px" onclick="APP.stopFlag=true">■ Stop</button>
+      <button class="tbtn" style="padding:2px 8px;font-size:10px" onclick="bc_clearQueue()">🗑 Clear Queue</button>
+      <button class="tbtn" style="padding:2px 8px;font-size:10px" onclick="bc_retryFailed()">🔄 Retry Failed</button>
+      <button class="tbtn" style="padding:2px 8px;font-size:10px;margin-left:auto" onclick="bc_exportQueue()">📥 Export Queue Status</button>
+    </div>
+    ${qTotal?`
+    <div class="panel">
+      <div class="panel-head">Queue Status <span class="badge bg">${qDone} done</span> <span class="badge br">${queue.filter(q=>q.status==='failed').length} failed</span> <span class="badge by">${queue.filter(q=>!q.done).length} pending</span></div>
+      <div class="panel-body" style="padding:0">
+        <div class="tbl-wrap" style="max-height:500px;overflow-y:auto"><table>
+          <thead><tr><th>#</th><th>URL</th><th>CMS</th><th>Method</th><th>Status</th><th>Reason</th></tr></thead>
+          <tbody>
+            ${queue.slice(0,500).map((q,i)=>`<tr style="opacity:${q.done?0.6:1}">
+              <td class="mono xs tm">${i+1}</td>
+              <td class="mono xs" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(q.url)}"><a href="${esc(q.url)}" target="_blank">${esc(q.url.replace(/https?:\/\//,'').slice(0,50))}</a></td>
+              <td><span class="badge ${(q.cms||'?')==='wordpress'?'bg':'bgray'}">${q.cms||'—'}</span></td>
+              <td><span class="badge bgray">${q.method||'—'}</span></td>
+              <td><span class="badge ${q.status==='posted'||q.status==='live'||q.status==='pending_moderation'?'bg':q.status==='failed'?'br':q.done?'bgray':'by'}">${q.status||'queued'}</span></td>
+              <td class="xs tm">${esc(q.reason||'—')}</td>
+            </tr>`).join('')}
+            ${qTotal>500?`<tr><td colspan="6" style="text-align:center;font-size:10px;color:var(--text3);padding:8px">... ${qTotal-500} more rows not shown</td></tr>`:''}
+          </tbody>
+        </table></div>
+      </div>
+    </div>`:`<div class="notice ni-b" style="text-align:center;padding:20px">
+      <div style="font-size:13px;margin-bottom:6px">No queue built yet</div>
+      <div style="font-size:11px;color:var(--text3)">Go to Config tab, paste your target URLs, and click <strong>Build Queue &amp; Start</strong>.</div>
+    </div>`}
+  </div>
+
+  <!-- ═══ MONITOR TAB ═══ -->
   <div style="display:${activeTab==='monitor'?'block':'none'}">
     <div class="panel">
       <div class="panel-head">📡 Approval Monitor
@@ -5599,33 +5803,34 @@ function render_commenter(el){
         </div>
       </div>
       <div class="panel-body">
-        <div class="notice ni-b" style="margin-bottom:8px">Re-Check fetches each target page and scans for your comment text. Run periodically — moderated comments can take hours or days to appear.</div>
+        <div class="notice ni-b" style="margin-bottom:8px">Re-Check fetches each target page and scans for your comment text. Moderated comments can take hours or days to appear.</div>
         <div class="g4" style="margin-bottom:8px">
-          <div class="stat"><div class="stat-v sv-g">${approved}</div><div class="stat-l">✓ Approved</div></div>
-          <div class="stat"><div class="stat-v sv-y">${APP.comments.filter(c=>c.approvalStatus==='pending'||c.status==='pending_moderation').length}</div><div class="stat-l">⏳ Pending</div></div>
-          <div class="stat"><div class="stat-v sv-r">${APP.comments.filter(c=>c.approvalStatus==='rejected'||c.status==='failed').length}</div><div class="stat-l">✗ Rejected</div></div>
-          <div class="stat"><div class="stat-v sv-b">${APP.comments.filter(c=>!c.approvalStatus||c.approvalStatus==='unknown').length}</div><div class="stat-l">? Unchecked</div></div>
+          <div class="stat"><div class="stat-v sv-g">${approved}</div><div class="stat-l">✓ Live</div></div>
+          <div class="stat"><div class="stat-v sv-y">${allComments.filter(c=>c.approvalStatus==='pending'||c.status==='pending_moderation').length}</div><div class="stat-l">⏳ Pending</div></div>
+          <div class="stat"><div class="stat-v sv-r">${allComments.filter(c=>c.approvalStatus==='rejected'||c.status==='failed').length}</div><div class="stat-l">✗ Rejected</div></div>
+          <div class="stat"><div class="stat-v sv-b">${allComments.filter(c=>!c.approvalStatus||c.approvalStatus==='unknown').length}</div><div class="stat-l">? Unchecked</div></div>
         </div>
       </div>
     </div>
-    ${APP.comments.length?`<div class="panel"><div class="panel-head">All Comments <span class="badge bg">${APP.comments.length}</span></div>
+    ${allComments.length?`<div class="panel" style="margin-top:8px"><div class="panel-head">All Comments <span class="badge bg">${allComments.length}</span></div>
       <div class="panel-body" style="padding:0"><div class="tbl-wrap"><table>
-        <thead><tr><th>#</th><th>Target</th><th>Name</th><th>CMS</th><th>Method</th><th>Status</th><th>Approval</th><th>Reason</th><th>Date</th><th></th></tr></thead>
-        <tbody>${APP.comments.slice().reverse().map((c,i)=>`<tr>
-          <td class="mono xs tm">${APP.comments.length-i}</td>
+        <thead><tr><th>#</th><th>Target</th><th>Name</th><th>Anchor</th><th>CMS</th><th>Method</th><th>Status</th><th>Approval</th><th>Date</th><th></th></tr></thead>
+        <tbody>${allComments.slice().reverse().map((c,i)=>`<tr>
+          <td class="mono xs tm">${allComments.length-i}</td>
           <td class="mono xs" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${esc(c.target)}" target="_blank">${esc(c.target.replace(/https?:\/\//,'').slice(0,38))}</a></td>
           <td class="xs">${esc(c.name)}</td>
+          <td class="xs tm" style="max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.kw||'')}">${esc((c.kw||'').slice(0,20))}</td>
           <td><span class="badge ${c.cms==='wordpress'?'bg':'bgray'}">${c.cms||'?'}</span></td>
           <td><span class="badge ${c.method==='xmlrpc'?'bb':c.method==='form_post'?'bp':'bgray'}">${c.method||'?'}</span></td>
           <td><span class="badge ${['posted','live'].includes(c.status)?'bg':c.status==='pending_moderation'?'by':'br'}">${c.status||'?'}</span></td>
           <td><span class="badge ${c.approvalStatus==='approved'?'bg':c.approvalStatus==='pending'?'by':c.approvalStatus==='rejected'?'br':'bgray'}">${c.approvalStatus||'—'}</span></td>
-          <td class="xs tm">${esc(c.reason||'')}</td>
           <td class="mono xs tm">${esc(c.date)}</td>
-          <td><button class="tbtn" style="padding:1px 5px;font-size:9px" onclick="bc_recheckOne(${APP.comments.length-1-i})">🔄</button></td>
+          <td><button class="tbtn" style="padding:1px 5px;font-size:9px" onclick="bc_recheckOne(${allComments.length-1-i})">🔄</button></td>
         </tr>`).join('')}</tbody>
       </table></div></div></div>`:'<div class="panel"><div class="panel-body mono xs tm">No comments yet.</div></div>'}
   </div>
 
+  <!-- ═══ TEMPLATES TAB ═══ -->
   <div style="display:${activeTab==='templates'?'block':'none'}">
     <div class="g2">
       <div class="panel">
@@ -5644,148 +5849,293 @@ function render_commenter(el){
         </div>
       </div>
       <div class="panel">
-        <div class="panel-head">🎯 Style Reference</div>
+        <div class="panel-head">🎯 Style Guide</div>
         <div class="panel-body" style="font-size:11px;line-height:1.8;color:var(--text2)">
           <div style="margin-bottom:8px"><strong style="color:var(--green)">Natural</strong> — First-person, conversational. Sounds like a genuine reader.</div>
-          <div style="margin-bottom:8px"><strong style="color:var(--blue)">Expert</strong> — Mentions testing/comparing. References outcomes. Positions as experienced.</div>
+          <div style="margin-bottom:8px"><strong style="color:var(--blue)">Expert</strong> — References testing/comparing. Positions commenter as experienced.</div>
           <div style="margin-bottom:8px"><strong style="color:var(--yellow)">Question</strong> — Ends with question to author. More engagement, less spam-like.</div>
           <div style="margin-bottom:8px"><strong style="color:var(--purple)">Compliment</strong> — Opens with specific praise referencing article topic.</div>
-          <div><strong style="color:var(--text3)">Spin:</strong> <code>{word1|word2|word3}</code> — one chosen randomly per post. Nested: <code>{{Very|Really} good|Excellent}</code></div>
+          <div style="margin-bottom:8px"><strong style="color:var(--cyan)">Mixed</strong> — Randomly picks any style per comment. Best for mass volume.</div>
+          <div style="padding-top:8px;border-top:1px solid var(--win-border)"><strong style="color:var(--text3)">Tips for mass backlinks:</strong><br>
+            • Keep comments 2-4 sentences — longer gets held for moderation<br>
+            • Use spin syntax {word1|word2} to vary each comment<br>
+            • Include the anchor keyword naturally in the comment text<br>
+            • Multiple anchors in "Anchor Keywords" = natural variation across posts
+          </div>
         </div>
       </div>
     </div>
   </div>
 
+  <!-- ═══ XML-RPC / PROXY TAB ═══ -->
   <div style="display:${activeTab==='xmlrpc'?'block':'none'}">
     <div class="g2">
-      <div class="panel">
-        <div class="panel-head">🔧 XML-RPC Direct Poster</div>
-        <div class="panel-body">
-          <div class="notice ni-y" style="margin-bottom:8px">Posts directly to <code>/xmlrpc.php</code> — bypasses comment form entirely. Works on most WordPress installs unless explicitly disabled. Anonymous comments must be enabled in WP Settings → Discussion.</div>
-          <div class="notice ni-b" style="margin-bottom:8px">
-            <strong style="color:var(--yellow)">ℹ Supabase in this app = data sync only</strong> — it stores your results/settings, not execute HTTP requests. For true server-side comment posting (no CORS limits), deploy a Supabase Edge Function and paste the URL below. Otherwise the app uses corsproxy.io → allorigins → crossorigin.me fallback chain automatically.
+      <div>
+        <div class="panel">
+          <div class="panel-head">🔧 XML-RPC Direct Poster</div>
+          <div class="panel-body">
+            <div class="notice ni-y" style="margin-bottom:8px">Posts directly to <code>/xmlrpc.php</code> — bypasses comment form entirely. Works on most WordPress installs unless explicitly disabled.</div>
+            <div class="notice ni-b" style="margin-bottom:8px">
+              <strong style="color:var(--yellow)">ℹ Supabase in this app = data sync only.</strong> It stores your results/settings, not execute HTTP requests. For true server-side posting (zero CORS limits), deploy a Supabase Edge Function and paste the URL below. Otherwise the app uses corsproxy.io → allorigins → crossorigin.me fallback chain.
+            </div>
+            <div class="fg"><label class="lbl">Supabase Edge Function URL <span style="color:var(--text3);font-weight:normal">(optional — true server-side, bypasses all CORS)</span></label>
+              <input type="url" id="bc-edge-fn" placeholder="https://xxxx.supabase.co/functions/v1/comment-poster" value="${esc(edgeFn)}" oninput="localStorage.setItem('rf_bc_edge_fn',this.value);log('Edge function URL saved','ok')"/>
+            </div>
+            <div style="margin-bottom:10px;font-size:10px;color:var(--text3);line-height:1.7">Edge function receives: <code style="color:var(--cyan)">{ type:'xmlrpc'|'form', url, xml|body }</code> → returns <code style="color:var(--cyan)">{ body: '...' }</code></div>
+            <div class="fg"><label class="lbl">Target WordPress Post URL</label><input type="url" id="xrpc-target" placeholder="https://example.com/2024/01/some-post/"/></div>
+            <div class="fg"><label class="lbl">Post ID (0 = auto-detect)</label><input type="number" id="xrpc-postid" value="0" min="0"/></div>
+            <div class="g2">
+              <div class="fg"><label class="lbl">Author Name</label><input type="text" id="xrpc-name" placeholder="Alex Reid"/></div>
+              <div class="fg"><label class="lbl">Author Email</label><input type="email" id="xrpc-email" placeholder="alex.reid99@gmail.com"/></div>
+            </div>
+            <div class="fg"><label class="lbl">Author URL (your backlink)</label><input type="url" id="xrpc-authorurl" placeholder="https://yoursite.com"/></div>
+            <div class="fg"><label class="lbl">Comment Text</label><textarea id="xrpc-comment" rows="4" placeholder="Write your comment here..."></textarea></div>
+            <div class="flex g6 mt8">
+              <button class="tbtn go" onclick="bc_xmlrpcTest()">▶ Post via XML-RPC</button>
+              <button class="tbtn" onclick="bc_xmlrpcProbe()">🔬 Probe XML-RPC Status</button>
+            </div>
+            <div id="xrpc-result" style="display:none;margin-top:8px" class="notice ni-b"></div>
           </div>
-          <div class="fg"><label class="lbl">Supabase Edge Function URL <span style="color:var(--text3);font-weight:normal">(optional — for server-side posting, bypasses all CORS)</span></label>
-            <input type="url" id="bc-edge-fn" placeholder="https://xxxx.supabase.co/functions/v1/comment-poster" value="${localStorage.getItem('rf_bc_edge_fn')||''}" oninput="localStorage.setItem('rf_bc_edge_fn',this.value);log('Edge function URL saved','ok')"/>
-          </div>
-          <div style="margin-bottom:8px;font-size:10px;color:var(--text3);line-height:1.7">Edge function receives: <code style="color:var(--cyan)">{ type:'xmlrpc'|'form', url, xml|body }</code> and should return <code style="color:var(--cyan)">{ body: '...' }</code>. Deploy from the Supabase dashboard → Edge Functions.</div>
-          <div class="fg"><label class="lbl">Target WordPress Post URL</label><input type="url" id="xrpc-target" placeholder="https://example.com/2024/01/some-post/"/></div>
-          <div class="fg"><label class="lbl">Post ID (0 = auto-detect from page HTML)</label><input type="number" id="xrpc-postid" value="0" min="0"/></div>
-          <div class="g2">
-            <div class="fg"><label class="lbl">Author Name</label><input type="text" id="xrpc-name" placeholder="Alex Reid"/></div>
-            <div class="fg"><label class="lbl">Author Email</label><input type="email" id="xrpc-email" placeholder="alex.reid99@gmail.com"/></div>
-          </div>
-          <div class="fg"><label class="lbl">Author URL (your backlink)</label><input type="url" id="xrpc-authorurl" placeholder="https://yoursite.com"/></div>
-          <div class="fg"><label class="lbl">Comment Text</label><textarea id="xrpc-comment" rows="4" placeholder="Write your comment here..."></textarea></div>
-          <div class="flex g6 mt8">
-            <button class="tbtn go" onclick="bc_xmlrpcTest()">▶ Post via XML-RPC</button>
-            <button class="tbtn" onclick="bc_xmlrpcProbe()">🔬 Probe XML-RPC Status</button>
-          </div>
-          <div id="xrpc-result" style="display:none;margin-top:8px" class="notice ni-b"></div>
         </div>
       </div>
-      <div class="panel">
-        <div class="panel-head">🔬 XML-RPC Probe</div>
-        <div class="panel-body">
-          <div class="fg"><label class="lbl">Domain to Probe</label><input type="url" id="xrpc-probe-url" placeholder="https://example.com"/></div>
-          <button class="tbtn go mt6" onclick="bc_xmlrpcProbeUrl()">Probe</button>
-          <div id="xrpc-probe-result" style="margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--text2);line-height:1.8"></div>
-          <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--win-border);font-size:10px;color:var(--text2);line-height:1.7">
-            <strong style="color:var(--text3)">How it works:</strong><br>
-            1. Fetch post page → extract <code>comment_post_ID</code><br>
-            2. Build <code>wp.newComment</code> XML payload<br>
-            3. POST to <code>/xmlrpc.php</code> via CORS proxy<br>
-            4. Success = integer comment ID returned<br>
-            Fault 403 = xmlrpc disabled &nbsp;·&nbsp; Fault 500 = no anon comments<br>
-            Fault 801 = duplicate &nbsp;·&nbsp; Auto falls back to form POST on failure
+      <div>
+        <div class="panel">
+          <div class="panel-head">🔬 XML-RPC Probe</div>
+          <div class="panel-body">
+            <div class="fg"><label class="lbl">Domain to Probe</label><input type="url" id="xrpc-probe-url" placeholder="https://example.com"/></div>
+            <button class="tbtn go mt6" onclick="bc_xmlrpcProbeUrl()">Probe</button>
+            <div id="xrpc-probe-result" style="margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--text2);line-height:1.8"></div>
+            <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--win-border);font-size:10px;color:var(--text2);line-height:1.7">
+              <strong style="color:var(--text3)">CORS Proxy Chain for POSTs:</strong><br>
+              1. <code style="color:var(--green)">corsproxy.io</code> (primary — reliable POST support)<br>
+              2. <code style="color:var(--yellow)">allorigins.win/raw</code> (fallback)<br>
+              3. <code style="color:var(--text3)">crossorigin.me</code> (tertiary)<br>
+              4. <code style="color:var(--blue)">Edge Function</code> (if configured — server-side, no CORS)<br><br>
+              <strong style="color:var(--text3)">GET Chain:</strong> allorigins → corsproxy.io → codetabs → thingproxy
+            </div>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:8px">
+          <div class="panel-head">📋 Supabase Edge Function Code</div>
+          <div class="panel-body">
+            <div style="font-size:10px;color:var(--text3);margin-bottom:6px">Deploy this to Supabase Edge Functions for true server-side posting:</div>
+            <div style="font-size:10px;color:var(--green);margin-bottom:6px;line-height:1.8">
+              <strong>Deploy steps:</strong><br>
+              1. Install Supabase CLI: <code>npm i -g supabase</code><br>
+              2. <code>supabase login</code><br>
+              3. <code>supabase functions new comment-poster</code><br>
+              4. Paste the downloaded <code>index.ts</code> into <code>supabase/functions/comment-poster/index.ts</code><br>
+              5. <code>supabase functions deploy comment-poster --no-verify-jwt</code><br>
+              6. Copy the function URL → paste into the field above<br>
+              <span style="color:var(--yellow)">⚠ Use <code>--no-verify-jwt</code> so RankForge can call it without auth headers</span>
+            </div>
+            <div style="font-size:10px;color:var(--text3);margin-bottom:6px">The full <code>index.ts</code> is in the downloaded <strong>comment-poster-edge-fn.ts</strong> file alongside this HTML. It handles three modes: <code>wp_comment</code> (full session flow), <code>form_comment</code> (generic blogs), <code>xmlrpc</code> (direct XML-RPC). The function fetches the page server-side to get the real nonce + session cookies, then POSTs the comment in the same session — exactly how a real browser does it.</div>
+            <pre style="font-family:var(--mono);font-size:9px;color:var(--cyan);background:var(--win-bg);border:1px solid var(--win-border);padding:8px;overflow-x:auto;line-height:1.5;border-radius:2px;max-height:160px">// Excerpt — download full index.ts file
+Deno.serve(async (req) => {
+  const { type, pageUrl, author, email, website, comment, ... } = await req.json();
+  if (type === "wp_comment") {
+    // 1. GET post page → extract cookies + nonce + postId
+    const page = await fetch(pageUrl, { headers: { "User-Agent": "..." } });
+    const cookies = parseCookies(page.headers);
+    const html = await page.text();
+    const nonce = extractNonce(html);
+    const postId = extractPostId(html);
+    // 2. POST comment in SAME session (cookies forwarded)
+    const post = await fetch(actionUrl, {
+      method: "POST", headers: { Cookie: cookies, Referer: pageUrl, ... },
+      body: buildParams({ comment_post_ID: postId, _wpnonce: nonce, author, email, ... })
+    });
+    // 3. Interpret redirect / response and return result
+  }
+});</pre>
+            <button class="tbtn" style="margin-top:6px" onclick="navigator.clipboard.writeText(document.querySelector('#page-commenter pre').textContent);log('Snippet copied — download the full file for complete code','ok')">📋 Copy Snippet</button>
           </div>
         </div>
       </div>
     </div>
   </div>`;
+
+  // Live URL count
+  const ta = document.getElementById('bc-targets');
+  const cnt = document.getElementById('bc-url-count');
+  if(ta && cnt) {
+    const updateCount = () => { cnt.textContent = ta.value.split('\n').filter(l=>l.trim()).length + ' URLs'; };
+    ta.addEventListener('input', updateCount);
+    updateCount();
+  }
 }
 
-function bc_preview(){
-  const url=(document.getElementById('bc-url')||{value:''}).value.trim()||'https://yoursite.com';
-  const kw=(document.getElementById('bc-kw')||{value:''}).value.trim()||'best VPN';
-  const nameField=(document.getElementById('bc-name')||{value:''}).value.trim();
-  const spinOn=(document.getElementById('bc-spin')||{value:'yes'}).value==='yes';
-  const templates=SS.get('rf_ctpls',CTPLS);
-  const previews=[];
-  for(let i=0;i<3;i++){
-    let tpl=templates[rand(0,templates.length-1)];
-    if(spinOn)tpl=bc_spin(tpl);
-    const comment=tpl.replace(/{url}/g,url).replace(/{kw}/g,kw).replace(/{anchor}/g,kw);
-    const name=nameField||CNAMES[rand(0,CNAMES.length-1)];
-    const email=bc_genEmail(name,'firstlast99');
-    previews.push({comment,name,email});
+// ── QUEUE MANAGEMENT ──────────────────────────────────────────────────────────
+function bc_buildQueue(targets, moneyUrl, websiteField, kwList) {
+  // Build fresh queue with per-URL metadata, respecting max-per-domain
+  const maxPerDomain = parseInt(SS.raw('rf_bc_maxperdomain')||'3');
+  const domainCount = {};
+  const queue = [];
+  for (const url of targets) {
+    try {
+      const domain = new URL(url).hostname.replace(/^www\./,'');
+      domainCount[domain] = (domainCount[domain]||0) + 1;
+      if (domainCount[domain] > maxPerDomain) {
+        log(`[Queue] Skipping ${url.slice(0,40)} — domain limit (${maxPerDomain}) reached`,'warn');
+        continue;
+      }
+      const kw = kwList[rand(0, kwList.length-1)] || 'keyword';
+      queue.push({ url, moneyUrl, websiteField, kw, done:false, status:'queued', cms:null, method:null, reason:null });
+    } catch(e) {}
   }
-  const panel=document.getElementById('bc-preview-panel');
-  const body=document.getElementById('bc-preview-body');
-  if(body)body.innerHTML=previews.map((p,i)=>`
-    <div style="margin-bottom:10px;padding:8px;background:var(--win-panel2);border-radius:2px;border:1px solid var(--win-border)">
-      <div class="mono xs tm" style="margin-bottom:4px">Variant ${i+1} — <strong style="color:var(--green)">${esc(p.name)}</strong> <span style="color:var(--text3);margin-left:8px">${esc(p.email)}</span></div>
-      <div style="font-size:11px;color:var(--text2);line-height:1.6">${esc(p.comment)}</div>
-    </div>`).join('');
-  if(panel)panel.style.display='block';
+  SS.set('rf_bc_queue', queue);
+  log(`[Queue] Built ${queue.length} URLs (${targets.length - queue.length} skipped by domain limit)`, 'ok');
+  return queue;
+}
+
+function bc_clearQueue() {
+  if(!confirm('Clear the queue? This does not clear comment results.')) return;
+  SS.set('rf_bc_queue', []);
+  render_commenter(document.getElementById('page-commenter'));
+  log('Queue cleared','warn');
+}
+
+function bc_retryFailed() {
+  const queue = SS.get('rf_bc_queue', []);
+  let retried = 0;
+  queue.forEach(q => { if(q.status==='failed'||q.status==='fetch_error') { q.done=false; q.status='queued'; q.method=null; q.reason=null; retried++; } });
+  SS.set('rf_bc_queue', queue);
+  render_commenter(document.getElementById('page-commenter'));
+  log(`[Queue] ${retried} failed items reset for retry`, 'ok');
+}
+
+function bc_exportQueue() {
+  const queue = SS.get('rf_bc_queue', []);
+  if (!queue.length) { alert('No queue data.'); return; }
+  dlCSV('URL,KW,Done,Status,CMS,Method,Reason\n'+queue.map(q=>`"${q.url}","${q.kw||''}","${q.done}","${q.status||''}","${q.cms||''}","${q.method||''}","${q.reason||''}"`).join('\n'),'bc_queue_status.csv');
+}
+
+function bc_dedupeTargets() {
+  const ta = document.getElementById('bc-targets');
+  if (!ta) return;
+  const urls = [...new Set(ta.value.split('\n').map(l=>l.trim()).filter(Boolean))];
+  ta.value = urls.join('\n');
+  const cnt = document.getElementById('bc-url-count');
+  if(cnt) cnt.textContent = urls.length + ' URLs';
+  log(`Deduped → ${urls.length} unique URLs`, 'ok');
+}
+
+function bc_pasteFromClipboard() {
+  navigator.clipboard.readText().then(text => {
+    const ta = document.getElementById('bc-targets');
+    if(ta) { ta.value = (ta.value ? ta.value+'\n' : '') + text.trim(); log('Pasted from clipboard','ok'); }
+  }).catch(()=>log('Clipboard access denied','err'));
+}
+
+function bc_importTxt() {
+  const inp = document.createElement('input');
+  inp.type='file'; inp.accept='.txt,.csv';
+  inp.onchange = e => {
+    const file = e.target.files[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const lines = ev.target.result.split(/\r?\n/).map(l=>l.trim()).filter(l=>l.startsWith('http'));
+      const ta = document.getElementById('bc-targets');
+      if(ta) ta.value = (ta.value ? ta.value+'\n' : '') + lines.join('\n');
+      log(`Imported ${lines.length} URLs from ${file.name}`, 'ok');
+    };
+    reader.readAsText(file);
+  };
+  inp.click();
+}
+
+async function bc_buildQueueAndStart() {
+  const targetsRaw=(document.getElementById('bc-targets')||{value:''}).value.trim();
+  const moneyUrl=(document.getElementById('bc-url')||{value:''}).value.trim();
+  if(!targetsRaw||!moneyUrl){log('Enter target URLs and your money URL first','err');return;}
+  const targets=targetsRaw.split('\n').map(t=>t.trim()).filter(Boolean);
+  const websiteField=(document.getElementById('bc-website')||{value:''}).value.trim()||moneyUrl;
+  const kwRaw=(document.getElementById('bc-kw')||{value:''}).value.trim();
+  const kwList=kwRaw.split('\n').map(k=>k.trim()).filter(Boolean);
+  if(!kwList.length){log('Enter at least one anchor keyword','err');return;}
+  const batchSize=parseInt(SS.raw('rf_bc_batchsize')||'0');
+  const queue=bc_buildQueue(targets, moneyUrl, websiteField, kwList);
+  if(!queue.length){log('Queue is empty after deduplication','err');return;}
+  // If batchSize set, only queue up to that many
+  const toRun=batchSize>0?queue.slice(0,batchSize):queue;
+  log(`[Queue] Starting ${toRun.length} of ${queue.length} URLs${batchSize?` (batch of ${batchSize})`:''}`, 'info');
+  await bc_runQueue(toRun);
+}
+
+async function bc_resumeQueue() {
+  const queue=SS.get('rf_bc_queue',[]);
+  const remaining=queue.filter(q=>!q.done);
+  if(!remaining.length){log('No remaining items in queue — all done or queue is empty','warn');return;}
+  const batchSize=parseInt(SS.raw('rf_bc_batchsize')||'0');
+  const toRun=batchSize>0?remaining.slice(0,batchSize):remaining;
+  log(`[Queue] Resuming — ${toRun.length} remaining`,'info');
+  await bc_runQueue(toRun);
 }
 
 // ── MAIN ENGINE ───────────────────────────────────────────────────────────────
-async function start_commenter(){
-  const targetsRaw=(document.getElementById('bc-targets')||{value:''}).value.trim();
-  const moneyUrl=(document.getElementById('bc-url')||{value:''}).value.trim();
-  if(!targetsRaw||!moneyUrl){log('Enter target URLs and money URL','err');return;}
-  const targets=targetsRaw.split('\n').map(t=>t.trim()).filter(Boolean);
-  const kw=(document.getElementById('bc-kw')||{value:'keyword'}).value.trim()||'keyword';
-  const websiteField=(document.getElementById('bc-website')||{value:''}).value.trim()||moneyUrl;
-  const nameField=(document.getElementById('bc-name')||{value:''}).value.trim();
+async function bc_runQueue(toRun) {
   const method=(document.getElementById('bc-method')||{value:'auto'}).value;
-  const baseDelay=parseInt((document.getElementById('bc-delay')||{value:2000}).value)||2000;
+  const baseDelay=parseInt(SS.raw('rf_bc_delay')||'3000')||3000;
   const useVariance=(document.getElementById('bc-variance')||{value:'yes'}).value==='yes';
   const useProxy=(document.getElementById('bc-proxy')||{value:'no'}).value==='yes';
   const emailPat=(document.getElementById('bc-email')||{value:'firstlast99'}).value;
   const spinOn=(document.getElementById('bc-spin')||{value:'yes'}).value==='yes';
+  const nameField=(document.getElementById('bc-name')||{value:''}).value.trim();
   const captchaKey=SS.raw('rf_captcha_key');
   const templates=SS.get('rf_ctpls',CTPLS);
-  const prog=document.getElementById('bc-prog');
   const isDryRun=method==='detect';
-  APP.running=true;APP.stopFlag=false;
-  setStatus(isDryRun?'Detecting (dry run)...':'Commenting...');
-  log(`▶ Commenter — ${targets.length} targets · ${method}${useProxy?' · proxies':''} ${captchaKey?' · captcha':''}${isDryRun?' · DRY RUN':''}`,'info');
+  const prog=document.getElementById('bc-prog');
+  const progLbl=document.getElementById('bc-prog-label');
 
-  for(let i=0;i<targets.length;i++){
-    if(APP.stopFlag)break;
-    const target=targets[i];
-    if(prog)prog.style.width=Math.round(((i+1)/targets.length)*100)+'%';
-    setProgress(Math.round(((i+1)/targets.length)*100),`${i+1}/${targets.length}`);
+  APP.running=true; APP.stopFlag=false;
+  setStatus(isDryRun?'Detecting CMS...':'Commenting...');
+  log(`▶ Mass Commenter — ${toRun.length} targets · method:${method}${useProxy?' · proxies':''}${isDryRun?' · DRY RUN':''}`, 'info');
+
+  // Get the full queue to update done flags
+  let fullQueue = SS.get('rf_bc_queue', []);
+
+  for(let i=0; i<toRun.length; i++){
+    if(APP.stopFlag) break;
+    const item = toRun[i];
+    const target = item.url;
+    const moneyUrl = item.moneyUrl || SS.raw('rf_bc_moneyurl') || '';
+    const websiteField = item.websiteField || moneyUrl;
+    const kw = item.kw || 'keyword';
+
+    if(prog) prog.style.width=Math.round(((i+1)/toRun.length)*100)+'%';
+    if(progLbl) progLbl.textContent=`${i+1}/${toRun.length}`;
+    setProgress(Math.round(((i+1)/toRun.length)*100), `${i+1}/${toRun.length}`);
 
     let tpl=templates[rand(0,templates.length-1)];
-    if(spinOn)tpl=bc_spin(tpl);
+    if(spinOn) tpl=bc_spin(tpl);
     const comment=tpl.replace(/{url}/g,moneyUrl).replace(/{kw}/g,kw).replace(/{anchor}/g,kw);
     const name=nameField||CNAMES[rand(0,CNAMES.length-1)];
     const email=bc_genEmail(name,emailPat);
     const proxy=useProxy?getNextProxy():null;
-    if(proxy)log(`[Proxy] ${proxyLabel(proxy)} → ${target.slice(0,35)}`,'info');
+    if(proxy) log(`[Proxy] ${proxyLabel(proxy)} → ${target.slice(0,35)}`,'info');
 
     // Step 1: Fetch target page and detect CMS
-    let html='',cmsInfo={cms:'unknown',confidence:'low',signals:[]};
+    let html='', cmsInfo={cms:'unknown',confidence:'low',signals:[]};
     try{
-      // Use the multi-proxy GET chain (already handles allorigins + corsproxy.io + codetabs + thingproxy fallback)
       html = await bc_proxyGet(target, 12000);
       if(!html) throw new Error('empty response from all proxies');
       cmsInfo=bc_detectCMS(html,target);
       log(`[Detect] ${target.slice(0,40)} → ${cmsInfo.cms} (${cmsInfo.confidence})`,cmsInfo.cms!=='unknown'?'ok':'warn');
     }catch(e){
       log(`[Detect] ${target.slice(0,40)} → fetch failed: ${e.message}`,'err');
-      APP.comments.push({target,comment,name,email,website:websiteField,status:'failed',cms:'unknown',method:'failed',reason:'fetch_error: '+e.message,date:today(),submittedText:comment,approvalStatus:'unknown'});
-      APP.stats.failed++;APP.stats.processed++;updateStats();
+      const record={target,comment,name,email,kw,website:websiteField,status:'failed',cms:'unknown',method:'failed',reason:'fetch_error: '+e.message,date:today(),submittedText:comment,approvalStatus:'unknown'};
+      APP.comments.push(record); SS.set('rf_comments',APP.comments);
+      APP.stats.failed++; APP.stats.processed++; updateStats();
+      // Mark queue item done
+      const qi = fullQueue.findIndex(q=>q.url===target&&!q.done);
+      if(qi>-1){fullQueue[qi].done=true;fullQueue[qi].status='failed';fullQueue[qi].reason='fetch_error';fullQueue[qi].cms='unknown';}
+      SS.set('rf_bc_queue',fullQueue);
       await sleep(useVariance?bc_humanDelay(baseDelay):baseDelay);
       continue;
     }
 
-    // Extract form fields: WordPress-aware extractor + generic extractor
+    // Extract form fields
     let formInfo=bc_extractForm(html,target);
-    // If WP extractor didn't find an action and this isn't WP, use generic extractor
     if(!formInfo.action&&cmsInfo.cms!=='wordpress'){
       const genForm=bc_extractGenericForm(html,target);
       if(genForm.action) formInfo={...formInfo,...genForm};
@@ -5793,8 +6143,12 @@ async function start_commenter(){
 
     if(isDryRun){
       log(`[DryRun] cms:${cmsInfo.cms} postId:${formInfo.postId||'?'} nonce:${formInfo.nonce?'✓':'✗'} action:${formInfo.action?formInfo.action.slice(0,45):'?'} fields:[${(formInfo.detectedFieldNames||[]).slice(0,6).join(',')}]`,'info');
-      APP.comments.push({target,comment,name,email,website:websiteField,status:'detected_only',cms:cmsInfo.cms,method:'detect',reason:'dry_run',date:today(),submittedText:comment,approvalStatus:'unknown'});
-      APP.stats.processed++;updateStats();await sleep(500);continue;
+      const record={target,comment,name,email,kw,website:websiteField,status:'detected_only',cms:cmsInfo.cms,method:'detect',reason:'dry_run',date:today(),submittedText:comment,approvalStatus:'unknown'};
+      APP.comments.push(record); SS.set('rf_comments',APP.comments);
+      const qi=fullQueue.findIndex(q=>q.url===target&&!q.done);
+      if(qi>-1){fullQueue[qi].done=true;fullQueue[qi].status='detected_only';fullQueue[qi].cms=cmsInfo.cms;}
+      SS.set('rf_bc_queue',fullQueue);
+      APP.stats.processed++; updateStats(); await sleep(500); continue;
     }
 
     // Step 2: Captcha detection
@@ -5803,56 +6157,99 @@ async function start_commenter(){
     if(capMatch&&captchaKey){
       log(`[Captcha] Detected on ${target.slice(0,30)} — solving...`,'warn');
       captchaToken=await solveCaptcha(capMatch[1],target);
-      if(captchaToken)log('[Captcha] Token ✓','ok');
+      if(captchaToken) log('[Captcha] Token ✓','ok');
     }
-    if(capMatch&&!captchaKey){
-      log(`[Captcha] reCAPTCHA detected but no 2captcha key set — may fail`,'warn');
-    }
+    if(capMatch&&!captchaKey) log(`[Captcha] reCAPTCHA detected — no solver key set, may fail`,'warn');
 
-    // Step 3: Post — Strategy based on CMS and method setting
+    // Step 3: Post — Railway server-side (best) → XML-RPC → Form POST
     let result={ok:false,method:'none',reason:'no_attempt'};
     const tryXmlrpc=method==='xmlrpc'||(method==='auto'&&cmsInfo.cms==='wordpress');
     const tryForm=method==='form'||method==='auto';
 
-    // WordPress: try XML-RPC first (bypasses nonce/session issues entirely)
-    if(tryXmlrpc&&cmsInfo.cms==='wordpress'){
-      log(`[XML-RPC] → ${target.slice(0,40)}`,'info');
-      result=await bc_xmlrpcPost(new URL(target).origin,formInfo.postId||'0',{authorName:name,authorEmail:email,authorUrl:websiteField,content:comment});
-      log(`[XML-RPC] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
+    // ── RAILWAY: real server-side posting with cookies/sessions ──
+    if(RW.enabled){
+      log(`[Railway] commenting → ${target.slice(0,40)}`,'info');
+      try{
+        const r=await RW.comment({url:target,authorName:name,authorEmail:email,authorUrl:websiteField,comment,method,captchaToken:captchaToken||null});
+        if(r && (r.ok || r.method)) { result=r; log(`[Railway] ${result.ok?'✓':'✗'} ${result.method||''} ${result.reason||''}`,result.ok?'ok':'warn'); }
+      }catch(e){ log(`[Railway] error: ${e.message} — falling back to proxy chain`,'warn'); }
     }
 
-    // Form POST fallback — works for WordPress AND all other CMSes
-    if(!result.ok&&tryForm){
-      log(`[Form POST] cms:${cmsInfo.cms} → ${target.slice(0,40)}`,'info');
-      // Determine action URL based on CMS
-      let actionUrl=formInfo.action;
-      if(!actionUrl){
-        if(cmsInfo.cms==='wordpress') actionUrl=new URL('/wp-comments-post.php',target).href;
-        else actionUrl=target; // POST back to the page itself (common for generic blogs)
+    // ── PROXY FALLBACK: XML-RPC then Form POST ──
+    if(!result.ok){
+      if(tryXmlrpc&&cmsInfo.cms==='wordpress'){
+        log(`[XML-RPC] → ${target.slice(0,40)}`,'info');
+        result=await bc_xmlrpcPost(new URL(target).origin,formInfo.postId||'0',{authorName:name,authorEmail:email,authorUrl:websiteField,content:comment});
+        log(`[XML-RPC] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
       }
-      result=await bc_formPost({...formInfo,author:name,email,website:websiteField,comment},actionUrl,captchaToken,cmsInfo.cms);
-      log(`[Form POST] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
+      if(!result.ok&&tryForm){
+        log(`[Form POST] cms:${cmsInfo.cms} → ${target.slice(0,40)}`,'info');
+        let actionUrl=formInfo.action;
+        if(!actionUrl){ actionUrl=cmsInfo.cms==='wordpress'?new URL('/wp-comments-post.php',target).href:target; }
+        result=await bc_formPost({...formInfo,author:name,email,website:websiteField,comment,pageUrl:target},actionUrl,captchaToken,cmsInfo.cms);
+        log(`[Form POST] ${result.ok?'✓':'✗'} ${result.reason}`,result.ok?'ok':'warn');
+      }
     }
 
-    // Step 4: Record
-    let finalStatus='failed',approvalStatus='unknown';
+    // Step 4: Record result
+    let finalStatus='failed', approvalStatus='unknown';
     if(result.ok){
       finalStatus=result.reason==='live'?'live':result.reason==='pending_moderation'?'pending_moderation':'posted';
       approvalStatus=result.reason==='live'?'approved':'pending';
       APP.stats.success++;
-    } else {APP.stats.failed++;}
+    } else { APP.stats.failed++; }
 
-    APP.comments.push({target,comment,name,email,website:websiteField,status:finalStatus,approvalStatus,cms:cmsInfo.cms,method:result.method,reason:result.reason,commentId:result.commentId||null,proxy:proxy?proxy.addr:null,date:today(),submittedText:comment});
+    const record={target,comment,name,email,kw,website:websiteField,status:finalStatus,approvalStatus,cms:cmsInfo.cms,method:result.method,reason:result.reason,commentId:result.commentId||null,proxy:proxy?proxy.addr:null,date:today(),submittedText:comment};
+    APP.comments.push(record);
     SS.set('rf_comments',APP.comments);
-    APP.stats.processed++;updateStats();
+
+    // Update queue item
+    const qi=fullQueue.findIndex(q=>q.url===target&&!q.done);
+    if(qi>-1){fullQueue[qi].done=true;fullQueue[qi].status=finalStatus;fullQueue[qi].cms=cmsInfo.cms;fullQueue[qi].method=result.method;fullQueue[qi].reason=result.reason;}
+    SS.set('rf_bc_queue',fullQueue);
+
+    APP.stats.processed++; updateStats();
     await sleep(useVariance?bc_humanDelay(baseDelay):baseDelay);
   }
 
-  APP.running=false;setStatus('Done');
+  APP.running=false; setStatus('Done');
   const s=APP.comments.reduce((a,c)=>{a[c.status]=(a[c.status]||0)+1;return a},{});
   log(`▶ Done — ${JSON.stringify(s)}`,'ok');
   render_commenter(document.getElementById('page-commenter'));
 }
+
+// Keep backwards compat with old start button wiring
+async function start_commenter(){
+  await bc_buildQueueAndStart();
+}
+
+function bc_preview(){
+  const moneyUrl=(document.getElementById('bc-url')||{value:''}).value.trim()||SS.raw('rf_bc_moneyurl')||'https://yoursite.com';
+  const kwRaw=(document.getElementById('bc-kw')||{value:''}).value.trim();
+  const kwList=kwRaw.split('\n').map(k=>k.trim()).filter(Boolean);
+  const kw=kwList[rand(0,kwList.length-1)]||'best VPN';
+  const nameField=(document.getElementById('bc-name')||{value:''}).value.trim();
+  const spinOn=(document.getElementById('bc-spin')||{value:'yes'}).value==='yes';
+  const templates=SS.get('rf_ctpls',CTPLS);
+  const previews=[];
+  for(let i=0;i<4;i++){
+    let tpl=templates[rand(0,templates.length-1)];
+    if(spinOn)tpl=bc_spin(tpl);
+    const comment=tpl.replace(/{url}/g,moneyUrl).replace(/{kw}/g,kw).replace(/{anchor}/g,kw);
+    const name=nameField||CNAMES[rand(0,CNAMES.length-1)];
+    const email=bc_genEmail(name,'firstlast99');
+    previews.push({comment,name,email,kw});
+  }
+  const panel=document.getElementById('bc-preview-panel');
+  const body=document.getElementById('bc-preview-body');
+  if(body)body.innerHTML=previews.map((p,i)=>`
+    <div style="margin-bottom:10px;padding:8px;background:var(--win-panel2);border-radius:2px;border:1px solid var(--win-border)">
+      <div class="mono xs tm" style="margin-bottom:4px">Variant ${i+1} — <strong style="color:var(--green)">${esc(p.name)}</strong> <span style="color:var(--text3);margin-left:8px">${esc(p.email)}</span> <span style="color:var(--cyan);margin-left:8px">anchor: ${esc(p.kw)}</span></div>
+      <div style="font-size:11px;color:var(--text2);line-height:1.6">${esc(p.comment)}</div>
+    </div>`).join('');
+  if(panel)panel.style.display='block';
+}
+
 
 // ── APPROVAL ─────────────────────────────────────────────────────────────────
 async function bc_recheckOne(i){
@@ -6305,6 +6702,80 @@ function render_link_builder(el){
   `;
 }
 
+// ═══════════════════════════════════════════════════
+// LINK BUILDER — v3.0 REAL WORKFLOW
+// How it works:
+//  1. Generates SEO-safe content for each chosen platform
+//  2. Opens the platform's publish URL in a new tab
+//  3. Copies the pre-written content to clipboard automatically
+//  4. User pastes & publishes (platforms require login — can't automate past auth)
+//  5. After publish, user pastes the real URL back → verified live
+//  6. lb_verifyOne fetches the real URL and confirms dofollow/nofollow status
+//  7. Telegra.ph is fully auto-publishable via API (no login required)
+// ═══════════════════════════════════════════════════
+
+// ── TELEGRAPH API — Only platform fully auto-publishable via API ──────────────
+async function lb_publishTelegraph(title, htmlContent, authorName='') {
+  try {
+    // Step 1: Create account (or use stored token)
+    let token = localStorage.getItem('rf_telegraph_token');
+    if (!token) {
+      const acResp = await _origFetch('https://api.telegra.ph/createAccount', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({short_name: authorName||'RankForge', author_name: authorName||'RankForge Writer'}),
+        signal: AbortSignal.timeout(10000)
+      });
+      const acData = await acResp.json();
+      if (!acData.ok) throw new Error(acData.error || 'createAccount failed');
+      token = acData.result.access_token;
+      localStorage.setItem('rf_telegraph_token', token);
+      log('[Telegraph] New account created, token saved', 'ok');
+    }
+
+    // Step 2: Convert markdown-like content to Telegraph node format
+    // Telegraph accepts simple paragraph array
+    const paragraphs = htmlContent.split(/\n\n+/).filter(p => p.trim()).map(p => {
+      const t = p.trim();
+      if (t.startsWith('# '))  return {tag:'h3', children:[t.slice(2)]};
+      if (t.startsWith('## ')) return {tag:'h4', children:[t.slice(3)]};
+      return {tag:'p', children:[t]};
+    });
+
+    // Step 3: Create page
+    const pgResp = await _origFetch('https://api.telegra.ph/createPage', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({access_token: token, title, author_name: authorName||'RankForge Writer', content: paragraphs, return_content: false}),
+      signal: AbortSignal.timeout(12000)
+    });
+    const pgData = await pgResp.json();
+    if (!pgData.ok) throw new Error(pgData.error || 'createPage failed');
+    return {ok: true, url: pgData.result.url, title: pgData.result.title};
+  } catch(e) {
+    return {ok: false, error: e.message};
+  }
+}
+
+// ── VERIFY A REAL URL IS LIVE AND CHECK LINK ATTRIBUTES ────────────────────
+async function lb_checkLinkLive(targetUrl, moneyUrl) {
+  try {
+    const html = await prx_corsGet(targetUrl, 12000);
+    if (!html || html.length < 200) return {live: false, reason: 'empty_or_404'};
+    // Check if our money URL appears in the page
+    const urlInPage = html.includes(moneyUrl) || html.includes(moneyUrl.replace(/^https?:\/\//, ''));
+    const isNofollow = (()=> {
+      // Find all anchor tags containing our money URL and check rel
+      const anchorRx = new RegExp('<a[^>]*href=["\']' + moneyUrl.replace(/[.*+?^${}()|[\]\\]/g,'\\$&').replace(/^https?:\/\//, 'https?:\/\/') + '["\'][^>]*>', 'i');
+      const anchorMatch = html.match(anchorRx) || html.match(/<a[^>]*rel=[^>]*nofollow[^>]*>/i);
+      return anchorMatch ? /nofollow/i.test(anchorMatch[0]) : false;
+    })();
+    return {live: true, urlInPage, dofollow: !isNofollow, htmlLen: html.length};
+  } catch(e) {
+    return {live: false, reason: e.message};
+  }
+}
+
 async function start_link_builder(){
   const moneyUrl=(document.getElementById('lb-url')||{value:''}).value.trim();
   if(!moneyUrl){log('Enter money URL','err');return;}
@@ -6324,13 +6795,12 @@ async function start_link_builder(){
   const acct = acctIdx!==''?APP.accounts[parseInt(acctIdx)]:null;
   const pbnDom = pbnIdx!==''?(window.TL_PBN||[])[parseInt(pbnIdx)]:null;
 
-  // Determine eligible platform pool
+  // Eligible platform pool
   let eligible = pbnDom
-    ? [{domain:pbnDom.domain||pbnDom, da:pbnDom.da||60, type:'PBN', platType:'blog', contentTpl:null}]
+    ? [{domain:pbnDom.domain||pbnDom, da:pbnDom.da||60, type:'PBN', platType:'blog', contentTpl:null, publishUrl:null}]
     : PLAT_DB.filter(p=>p.da>=minDa && (platmix==='auto'||p.platType===platmix));
-  if(!eligible.length){ log('No platforms match DA filter — lowering DA minimum by 20','warn'); eligible=PLAT_DB.filter(p=>p.da>=(minDa-20)); }
+  if(!eligible.length){ log('No platforms match DA filter — lowering by 20','warn'); eligible=PLAT_DB.filter(p=>p.da>=(minDa-20)); }
 
-  // Mix enforcement: sort eligible to cycle through platform types
   const typedEligible = {};
   eligible.forEach(p=>{ if(!typedEligible[p.platType]) typedEligible[p.platType]=[]; typedEligible[p.platType].push(p); });
   const typeKeys = Object.keys(typedEligible);
@@ -6339,14 +6809,15 @@ async function start_link_builder(){
   APP.running=true;APP.stopFlag=false;setStatus('Building links...');
   undoPush('link-builder-run');
   const kw = baseAnchor;
-  let lastContentPlatform=null;
+  let autoPublishedCount = 0;
+  let manualQueue = []; // Non-Telegraph links that need manual publish
 
   for(let i=0;i<count;i++){
     if(APP.stopFlag)break;
     setProgress(Math.round(((i+1)/count)*100),`${i+1}/${count}`);
     if(prog)prog.style.width=Math.round(((i+1)/count)*100)+'%';
 
-    // Pick platform — cycle through types for mix
+    // Pick platform — cycle through types
     let p;
     if(platmix==='auto' && typeKeys.length>1){
       const typeKey=typeKeys[i%typeKeys.length];
@@ -6359,83 +6830,191 @@ async function start_link_builder(){
     // Velocity footprint check
     const platformCount24h=lb_checkVelocityFootprint(p.type,24);
     if(platformCount24h>=10){
-      log(`⚠ Velocity footprint: ${p.type} used ${platformCount24h}x in 24h — skipping to alternate`,'warn');
+      log(`⚠ Velocity: ${p.type} used ${platformCount24h}x in 24h — rotating`,'warn');
       p=eligible[(i+1)%eligible.length];
     }
 
-    // Auto-vary anchor
+    // Auto-vary anchor text
     let {anchor, type:anchorType} = autoVary
       ? lb_autoVaryAnchor(baseAnchor, atype, brand, kw)
       : {anchor:baseAnchor, type:atype};
 
-    // Warn on exact match %
     const currentDist=lb_anchorDistribution();
     if((currentDist['Exact Match']?.pct||0)>5 && anchorType==='Exact Match'){
-      log('⚠ Exact match % exceeds 5% — switching to Brand anchor','warn');
+      log('⚠ Exact match >5% — switching to Brand','warn');
       anchor=brand||baseAnchor; anchorType='Brand';
     }
 
-    // Contextual wrap
     const contextPara = wrapContext ? lb_getContextPara(anchor, moneyUrl) : null;
+    const titleText = `${kw} — ${p.type} Guide`;
 
-    // Build URL
-    const slug=anchor.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'')+'-'+rand(100,9999);
-    const lurl = pbnDom ? `https://${pbnDom.domain||pbnDom}/${slug}` : `https://${p.domain}/${slug}`;
+    // Generate content using platform template
+    let content = '';
+    if (p.contentTpl) {
+      content = p.contentTpl(anchor, moneyUrl, kw);
+    } else {
+      content = `# ${titleText}\n\nA guide to ${kw}.\n\nFor the best resource on ${kw}, visit [${anchor}](${moneyUrl}).`;
+    }
 
-    // Record lineage
-    lineageRecord([lurl],'link_builder');
+    lineageRecord([p.publishUrl||p.domain],'link_builder');
+
+    // ── STRATEGY: Telegraph = fully auto. Everything else = guided manual. ──
+    let realUrl = null;
+    let publishStatus = 'pending_publish'; // user must publish and paste back real URL
+
+    if (p.domain === 'telegra.ph' || p.type === 'Telegraph') {
+      // FULLY AUTOMATED: Telegraph API supports anonymous publishing
+      log(`[Auto-Publish] Telegraph API → publishing...`,'info');
+      const result = await lb_publishTelegraph(titleText, content, brand||'RankForge');
+      if (result.ok) {
+        realUrl = result.url;
+        publishStatus = 'live';
+        autoPublishedCount++;
+        log(`[Auto-Publish] ✓ Telegraph: <a href="${result.url}" target="_blank" style="color:var(--green)">${result.url}</a>`,'ok');
+      } else {
+        log(`[Auto-Publish] ✗ Telegraph failed: ${result.error}`,'err');
+        publishStatus = 'failed';
+      }
+    } else {
+      // GUIDED MANUAL: Copy content + open platform
+      if (genContent) {
+        try { await navigator.clipboard.writeText(content); } catch(e) {}
+      }
+      manualQueue.push({platform: p, content, anchor, moneyUrl, kw, anchorType, tier});
+      realUrl = null;
+      publishStatus = 'pending_publish';
+    }
 
     const link={
-      url:lurl, da:pbnDom?pbnDom.da||60:p.da, anchor, type:anchorType,
-      platform:pbnDom?'PBN: '+(pbnDom.domain||pbnDom):p.type,
-      platType:p.platType||'blog', tier,
-      status:Math.random()>.3?'live':'pending',
-      date:today(),
+      url: realUrl || (p.publishUrl||`https://${p.domain}/`),
+      realUrl: realUrl,
+      da: pbnDom?pbnDom.da||60:p.da,
+      anchor, type:anchorType,
+      platform: pbnDom?'PBN: '+(pbnDom.domain||pbnDom):p.type,
+      platType: p.platType||'blog', tier,
+      status: publishStatus,
+      content,
+      publishUrl: p.publishUrl||null,
+      date: today(),
       contextPara,
       account: acct?acct.platform+'/'+acct.username:null,
       pbn: pbnDom?pbnDom.domain||pbnDom:null,
+      verified: realUrl ? undefined : null, // null = not publishable yet
     };
     APP.links.push(link);
-    roiTrackLink(lurl, 'link_builder');
-    heatmapRecord(p.type,'link_builder',link.status==='live'?'success':'fail');
-    log(`T${tier} → ${p.type}: <a href="${lurl}" target="_blank" style="color:var(--blue)">${anchor}</a> (DA${pbnDom?pbnDom.da||60:p.da}) [${anchorType}]`,'ok');
-    APP.stats.success++;APP.stats.processed++;updateStats();
-    await sleep(80);
+    roiTrackLink(realUrl||p.publishUrl||p.domain, 'link_builder');
+    heatmapRecord(p.type,'link_builder', publishStatus==='live'?'success':'pending');
 
-    // Generate content for last link if requested
-    if(genContent && i===count-1){
-      lastContentPlatform=p;
-    }
+    const statusIcon = publishStatus==='live'?'✅':publishStatus==='failed'?'❌':'📋';
+    log(`T${tier} ${statusIcon} ${p.type}: <b>${anchor}</b> (DA${pbnDom?pbnDom.da||60:p.da}) [${anchorType}] — ${publishStatus==='live'?'published':publishStatus==='failed'?'failed':'ready to publish'}`,publishStatus==='live'?'ok':'info');
+    APP.stats.processed++;
+    if(publishStatus==='live') APP.stats.success++;
+    updateStats();
+    await sleep(80);
   }
 
   SS.set('rf_links',APP.links);
   APP.running=false;setStatus('Done');
   runHistoryAdd('link_builder',count,APP.stats.success,APP.stats.failed);
-  log(`✅ Built ${count} links — ${APP.links.filter(l=>l.status==='live').length} live`,'ok');
 
-  // Auto-trigger ping submitter for built links (pattern: ping immediately after build)
-  const builtUrls=APP.links.slice(-count).map(l=>l.url);
-  if(builtUrls.length&&SS.get('rf_ps_schedules',[]).length){
-    log(`💡 Tip: ${builtUrls.length} new links ready — go to Ping Submitter → "Auto-ping Built Links" to index them immediately`,'info');
+  log(`✅ Done — ${autoPublishedCount} auto-published (Telegraph), ${manualQueue.length} ready to publish manually`,'ok');
+
+  // Show the manual publish queue UI if there are pending links
+  if (manualQueue.length > 0 && genContent) {
+    lb_showPublishQueue(manualQueue);
+    log(`📋 Content copied to clipboard for first platform. Use the Publish Queue panel to open each platform and paste.`,'info');
   }
 
-  // Generate platform content for last built link
-  if(genContent && lastContentPlatform && lastContentPlatform.contentTpl){
-    const lastLink=APP.links[APP.links.length-1];
-    const content=lastContentPlatform.contentTpl(lastLink.anchor,moneyUrl,kw);
-    const ta=document.getElementById('lb-content-ta');
-    const preview=document.getElementById('lb-content-preview');
-    const pubBtn=document.getElementById('lb-publish-btn');
-    if(ta)ta.value=content;
-    if(preview)preview.style.display='block';
-    if(pubBtn){
-      pubBtn.onclick=()=>window.open(lastContentPlatform.publishUrl,'_blank');
-    }
-    log(`Platform content generated for ${lastContentPlatform.type} — copy & publish`,'ok');
+  if(APP.links.filter(l=>l.realUrl).length){
+    log(`💡 After publishing, paste each real URL back using ✏ Edit URL in the links table, then click 🔍 Verify to confirm live status.`,'info');
   }
 
   render_link_builder(document.getElementById('page-link_builder'));
 }
+
+// ── PUBLISH QUEUE UI ─────────────────────────────────────────────────────────
+function lb_showPublishQueue(queue) {
+  let existing = document.getElementById('lb-publish-queue');
+  if (!existing) {
+    existing = document.createElement('div');
+    existing.id = 'lb-publish-queue';
+    const container = document.getElementById('page-link_builder');
+    if (container) container.insertBefore(existing, container.firstChild);
+  }
+  let qIdx = 0;
+  function renderQ() {
+    if (qIdx >= queue.length) {
+      existing.innerHTML = '<div class="notice ni-g" style="margin-bottom:10px">✅ All platforms opened! Paste each pre-written post and publish, then verify URLs.</div>';
+      return;
+    }
+    const item = queue[qIdx];
+    existing.innerHTML = `
+    <div class="panel" style="margin-bottom:10px;border:1px solid var(--yellow)">
+      <div class="panel-head" style="background:rgba(232,184,75,0.1)">
+        📋 Publish Queue — ${qIdx+1} of ${queue.length}: <strong style="color:var(--yellow)">${item.platform.type}</strong>
+        <div class="ph-r"><span class="badge by">DA ${item.platform.da}</span><span class="badge bgray">${item.anchorType}</span></div>
+      </div>
+      <div class="panel-body">
+        <div class="notice ni-b" style="margin-bottom:8px">
+          <strong>Step ${qIdx+1}:</strong> Click <strong>Open ${item.platform.type}</strong> to open the publish page. Content is already copied to your clipboard — just paste and publish. Then paste the live URL back below.
+        </div>
+        <div style="display:flex;gap:6px;margin-bottom:8px;align-items:center">
+          <button class="tbtn go" onclick="navigator.clipboard.writeText(document.getElementById('lbq-content').value).then(()=>log('Content copied!','ok')).catch(()=>{});window.open('${item.platform.publishUrl}','_blank')">
+            🌐 Open ${item.platform.type} + Copy Content
+          </button>
+          <button class="tbtn" onclick="lb_showPublishQueue_skip(${qIdx}, queue_${Date.now()})">⏭ Skip</button>
+          <span style="font-size:10px;color:var(--text3)">Anchor: <strong style="color:var(--cyan)">${item.anchor}</strong> | Money URL: ${item.moneyUrl.slice(0,40)}</span>
+        </div>
+        <div class="fg">
+          <label class="lbl">Paste your real published URL here after publishing:</label>
+          <div style="display:flex;gap:5px">
+            <input type="url" id="lbq-realurl-${qIdx}" placeholder="https://${item.platform.domain}/your-post-slug" style="flex:1"/>
+            <button class="tbtn go" onclick="lb_setRealUrl(${APP.links.length - queue.length + qIdx}, document.getElementById('lbq-realurl-${qIdx}').value, ${qIdx})">✓ Save URL</button>
+          </div>
+        </div>
+        <div class="fg" style="margin-top:6px">
+          <label class="lbl">Content to publish (also copied to clipboard):</label>
+          <textarea id="lbq-content" rows="8" style="width:100%;font-family:var(--mono);font-size:10px;resize:vertical">${item.content.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</textarea>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:6px">
+          <button class="tbtn" onclick="qIdx++;renderQ()" style="display:none" id="lbq-next-${qIdx}">→ Next Platform</button>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  // Expose queue to window for closure
+  window._lb_queue = queue;
+  window.lb_showPublishQueue_skip = (idx, _) => {
+    const linkIdx = APP.links.length - queue.length + idx;
+    if (APP.links[linkIdx]) APP.links[linkIdx].status = 'skipped';
+    SS.set('rf_links', APP.links);
+    qIdx = idx + 1;
+    renderQ();
+  };
+
+  renderQ();
+}
+
+// Save a real published URL back to the link record
+function lb_setRealUrl(linkIdx, url, queueIdx) {
+  url = (url||'').trim();
+  if (!url || !url.startsWith('http')) { log('Enter a valid URL (must start with http)','err'); return; }
+  const l = APP.links[linkIdx];
+  if (!l) { log('Link record not found','err'); return; }
+  l.url = url;
+  l.realUrl = url;
+  l.status = 'pending_verify';
+  l.publishedDate = today();
+  SS.set('rf_links', APP.links);
+  log(`✓ Real URL saved for ${l.platform}: ${url}`,'ok');
+  // Show next button
+  const nb = document.getElementById(`lbq-next-${queueIdx}`);
+  if (nb) nb.style.display = 'inline-flex';
+  // Auto-verify
+  lb_verifyOne(linkIdx).then(()=> render_link_builder(document.getElementById('page-link_builder')));
+}
+
 
 function lb_export(){
   dlCSV('URL,DA,Platform,Anchor,Type,Tier,Status,Verified,Account,Date\n'+
@@ -6461,26 +7040,31 @@ async function lb_verifyOne(idx){
   const l=APP.links[idx];
   if(!l)return;
   const logEl=document.getElementById('lb-ver-log');
-  try{
-    const res=await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(l.url)}`,{signal:AbortSignal.timeout(10000)});
-    if(!res.ok) throw new Error('Proxy error '+res.status);
-    const data=await res.json();
-    const html=data.contents||'';
-    const isLive=res.ok&&html.length>100;
-    const isNofollow=html.includes('rel="nofollow"')||html.includes("rel='nofollow'");
-    l.verified=isLive;
-    l.dofollow=isLive&&!isNofollow;
-    l.verifiedTs=Date.now();
-    SS.set('rf_links',APP.links);
-    const msg=`${isLive?'✓ LIVE':'✗ DEAD'} | ${isNofollow?'NOFOLLOW':'DOFOLLOW'} | ${l.url.slice(0,50)}`;
-    if(logEl)logEl.innerHTML+=`<div style="color:${isLive?'var(--green)':'var(--red)'};padding:1px 0">${msg}</div>`;
-    log(msg, isLive?'ok':'warn');
-  }catch(e){
-    l.verified=false;
-    SS.set('rf_links',APP.links);
-    if(logEl)logEl.innerHTML+=`<div style="color:var(--red)">✗ ERROR | ${l.url.slice(0,50)} — ${e.message}</div>`;
-    log(`Verify failed: ${l.url.slice(0,40)} — ${e.message}`,'warn');
+  // Only verify real/actual URLs — skip platform publish URLs and pending links
+  const urlToCheck = l.realUrl || l.url;
+  if(!urlToCheck||urlToCheck.includes('/new')||urlToCheck.includes('/start/')||l.status==='pending_publish'){
+    const msg = `⏭ SKIP | ${l.platform} — not yet published (paste real URL first)`;
+    if(logEl)logEl.innerHTML+=`<div style="color:var(--text3);padding:1px 0">${msg}</div>`;
+    log(msg,'warn');
+    return;
   }
+  const moneyUrl = SS.raw('rf_lb_url') || '';
+  if(logEl)logEl.innerHTML+=`<div style="color:var(--text3);padding:1px 0">🔍 Checking: ${urlToCheck.slice(0,60)}...</div>`;
+  const result = await lb_checkLinkLive(urlToCheck, moneyUrl);
+  l.verified = result.live;
+  l.dofollow = result.live ? result.dofollow : false;
+  l.urlInPage = result.urlInPage;
+  l.verifiedTs = Date.now();
+  l.verifyReason = result.reason||'';
+  if(result.live) l.status = 'live';
+  SS.set('rf_links',APP.links);
+  const statusIcon = result.live ? '✓ LIVE' : '✗ DEAD/UNVERIFIABLE';
+  const linkAttr = result.live ? (result.dofollow?'DOFOLLOW':'NOFOLLOW') : '—';
+  const urlFound = result.live ? (result.urlInPage?'money URL detected':'money URL not found in page') : result.reason||'';
+  const msg=`${statusIcon} | ${linkAttr} | ${urlFound} | ${urlToCheck.slice(0,45)}`;
+  const color = result.live ? (result.dofollow?'var(--green)':'var(--yellow)') : 'var(--red)';
+  if(logEl)logEl.innerHTML+=`<div style="color:${color};padding:1px 0">${msg} ${result.live?`<a href="${urlToCheck}" target="_blank" style="color:var(--blue);font-size:9px">↗</a>`:''}</div>`;
+  log(msg, result.live?'ok':'warn');
 }
 
 async function lb_verifyAll(){
@@ -8491,33 +9075,62 @@ const AC_PLATFORMS={
 };
 
 // Temp-mail providers with their API endpoints
+// ── TEMP MAIL PROVIDERS — multi-provider with CORS-safe API calls ─────────────
+// All providers are called directly (they support CORS for browser use).
+// Provider priority: 1SecMail (most reliable) → Guerrilla → TempMail.lol → Maildrop fallback
 const TMPMAIL_PROVIDERS=[
-  {name:'Guerrilla Mail',domain:'guerrillamailblock.com',
-   genUrl:()=>`https://api.guerrillamail.com/ajax.php?f=get_email_address`,
-   checkUrl:(addr)=>`https://api.guerrillamail.com/ajax.php?f=get_email_list&offset=0`,
-   parseEmail:(data)=>data?.email_addr||null,
-   parseInbox:(data)=>data?.list||[],
-   matchSubject:(item,kw)=>item?.mail_subject?.toLowerCase().includes(kw.toLowerCase()),
-   getBody:(item)=>item?.mail_excerpt||'',
+  {
+    name:'1SecMail',
+    domains:['1secmail.com','1secmail.org','1secmail.net','wwjmp.com','jourrapide.com'],
+    genUrl:()=>{
+      // 1SecMail supports CORS natively — no proxy needed
+      return `https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1`;
+    },
+    checkUrl:(addr)=>{
+      const[login,domain]=addr.split('@');
+      return`https://www.1secmail.com/api/v1/?action=getMessages&login=${login}&domain=${domain}`;
+    },
+    // Fetch full message body (includes HTML with verify links)
+    msgUrl:(addr,id)=>{
+      const[login,domain]=addr.split('@');
+      return`https://www.1secmail.com/api/v1/?action=readMessage&login=${login}&domain=${domain}&id=${id}`;
+    },
+    parseEmail:(data)=>Array.isArray(data)?data[0]:null,
+    parseToken:null,
+    parseInbox:(data)=>Array.isArray(data)?data:[],
+    matchSubject:(item,kw)=>(item?.subject||'').toLowerCase().includes(kw.toLowerCase()),
+    getBody:(item)=>item?.htmlBody||item?.body||item?.textBody||item?.subject||'',
+    fetchFullMsg: true, // signals ac_pollInbox to fetch full message body
   },
-  {name:'1SecMail',domain:'1secmail.com',
-   genUrl:(u)=>`https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1`,
-   checkUrl:(addr)=>{const[login,domain]=addr.split('@');return`https://www.1secmail.com/api/v1/?action=getMessages&login=${login}&domain=${domain}`;},
-   parseEmail:(data)=>Array.isArray(data)?data[0]:null,
-   parseInbox:(data)=>Array.isArray(data)?data:[],
-   matchSubject:(item,kw)=>item?.subject?.toLowerCase().includes(kw.toLowerCase()),
-   getBody:(item)=>item?.subject||'',
+  {
+    name:'Guerrilla Mail',
+    domains:['guerrillamailblock.com','grr.la','guerrillamail.info','guerrillamail.biz','guerrillamail.de','guerrillamail.net','guerrillamail.org'],
+    genUrl:()=>`https://api.guerrillamail.com/ajax.php?f=get_email_address`,
+    checkUrl:(addr,token)=>`https://api.guerrillamail.com/ajax.php?f=get_email_list&offset=0`,
+    parseEmail:(data)=>data?.email_addr||null,
+    parseToken:(data)=>data?.sid_token||null,
+    parseInbox:(data)=>data?.list||[],
+    matchSubject:(item,kw)=>(item?.mail_subject||'').toLowerCase().includes(kw.toLowerCase()),
+    getBody:(item)=>item?.mail_excerpt||item?.mail_body||'',
+    fetchFullMsg: false,
   },
-  {name:'TempMail.lol',domain:'tempmail.lol',
-   genUrl:()=>`https://api.tempmail.lol/generate`,
-   checkUrl:(addr,token)=>`https://api.tempmail.lol/auth/${token}`,
-   parseEmail:(data)=>data?.address||null,
-   parseToken:(data)=>data?.token||null,
-   parseInbox:(data)=>data?.email||[],
-   matchSubject:(item,kw)=>item?.subject?.toLowerCase().includes(kw.toLowerCase()),
-   getBody:(item)=>item?.body||item?.subject||'',
+  {
+    name:'TempMail.lol',
+    domains:['tempmail.lol'],
+    genUrl:()=>`https://api.tempmail.lol/generate`,
+    checkUrl:(addr,token)=>token?`https://api.tempmail.lol/auth/${token}`:`https://api.tempmail.lol/auth/RUSH`,
+    parseEmail:(data)=>data?.address||null,
+    parseToken:(data)=>data?.token||null,
+    parseInbox:(data)=>Array.isArray(data?.email)?data.email:[],
+    matchSubject:(item,kw)=>(item?.subject||'').toLowerCase().includes(kw.toLowerCase()),
+    getBody:(item)=>item?.body||item?.html||item?.subject||'',
+    fetchFullMsg: false,
   },
 ];
+
+// Get domain list across all providers for UI display
+function ac_getTempMailDomains(){ return TMPMAIL_PROVIDERS.flatMap(p=>p.domains||[]); }
+
 
 // Warm-up action templates per platform
 const WARMUP_ACTIONS={
@@ -8617,49 +9230,77 @@ function ac_warmupLevel(score){
 async function ac_genTempEmail(providerIdx=0){
   const p=TMPMAIL_PROVIDERS[providerIdx%TMPMAIL_PROVIDERS.length];
   try{
-    const resp=await fetch(p.genUrl(),{signal:AbortSignal.timeout(8000)});
+    // All temp mail providers support CORS for GET requests
+    const resp=await _origFetch(p.genUrl(),{signal:AbortSignal.timeout(8000)});
+    if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data=await resp.json();
     const address=p.parseEmail(data);
     const token=p.parseToken?p.parseToken(data):null;
-    if(!address)throw new Error('No address returned');
+    if(!address||!address.includes('@'))throw new Error('No valid address returned');
+    log(`[TempMail] Generated: ${address} via ${p.name}`,'ok');
     return{address,token,provider:p.name,providerIdx};
   }catch(e){
-    // Try next provider
-    if(providerIdx<TMPMAIL_PROVIDERS.length-1)return ac_genTempEmail(providerIdx+1);
-    // Fallback: generate a plausible address from 1secmail domains
-    const domains=['1secmail.com','1secmail.org','1secmail.net','jourrapide.com'];
+    log(`[TempMail] ${p.name} failed (${e.message}) — trying next provider`,'warn');
+    if(providerIdx<TMPMAIL_PROVIDERS.length-1) return ac_genTempEmail(providerIdx+1);
+    // Last resort fallback — known working 1secmail address format
+    const domains=['1secmail.com','1secmail.org','1secmail.net','wwjmp.com'];
     const user=`user${rand(10000,99999)}`;
-    return{address:`${user}@${domains[rand(0,domains.length-1)]}`,token:null,provider:'manual',providerIdx};
+    const address=`${user}@${domains[rand(0,domains.length-1)]}`;
+    log(`[TempMail] Using manual fallback address: ${address}`,'warn');
+    return{address,token:null,provider:'manual_fallback',providerIdx:0};
   }
 }
 
-async function ac_pollInbox(emailData, keywords=['verify','confirm','activate','welcome'], maxAttempts=12, intervalMs=5000){
+async function ac_pollInbox(emailData, keywords=['verify','confirm','activate','welcome','click','complete','account'], maxAttempts=15, intervalMs=5000){
   const p=TMPMAIL_PROVIDERS[emailData.providerIdx%TMPMAIL_PROVIDERS.length];
-  if(!p.checkUrl)return{found:false,reason:'provider_no_check'};
-  log(`[TempMail] Polling inbox: ${emailData.address} (up to ${maxAttempts} attempts, ${intervalMs/1000}s interval)`,'info');
+  if(!p||!p.checkUrl){return{found:false,reason:'provider_no_check_url'};}
+  log(`[TempMail] Polling ${emailData.address} every ${intervalMs/1000}s (max ${maxAttempts} attempts)`,'info');
+
   for(let attempt=1;attempt<=maxAttempts;attempt++){
+    if(window.APP?.stopFlag) return{found:false,reason:'stopped'};
     await sleep(intervalMs);
     try{
       const checkUrl=p.checkUrl(emailData.address,emailData.token);
-      const resp=await fetch(checkUrl,{signal:AbortSignal.timeout(8000)});
+      const resp=await _origFetch(checkUrl,{signal:AbortSignal.timeout(10000)});
+      if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data=await resp.json();
       const inbox=p.parseInbox(data);
-      if(!inbox||!inbox.length){log(`[TempMail] Attempt ${attempt}/${maxAttempts} — inbox empty`,'info');continue;}
-      // Find matching email
+      if(!inbox||!inbox.length){
+        log(`[TempMail] Attempt ${attempt}/${maxAttempts} — inbox empty`,'info');
+        continue;
+      }
+      log(`[TempMail] Attempt ${attempt}/${maxAttempts} — ${inbox.length} email(s) in inbox`,'info');
+      // Check all messages for keywords
       for(const item of inbox){
-        const matched=keywords.some(kw=>p.matchSubject(item,kw));
-        if(matched){
-          const body=p.getBody(item);
-          // Try to extract verification link
-          const linkMatch=body.match(/https?:\/\/[^\s"<>]+(?:verify|confirm|activate|token)[^\s"<>]*/i);
-          log(`[TempMail] ✓ Verification email found! Subject match. Link: ${linkMatch?linkMatch[0].slice(0,60)+'...':'(check manually)'}`,'ok');
-          return{found:true,item,verifyLink:linkMatch?linkMatch[0]:null,body,attempt};
+        const subjectMatch=keywords.some(kw=>p.matchSubject(item,kw));
+        // Also check if sender looks like an automated system email
+        const sender=(item?.from||item?.mail_from||item?.sender||'').toLowerCase();
+        const isSystemEmail=/noreply|no-reply|donotreply|notification|verify|welcome|confirm|account|support/i.test(sender);
+        if(subjectMatch||isSystemEmail){
+          let body=p.getBody(item)||'';
+          // For 1SecMail: fetch full message body (has HTML with real links)
+          if(p.fetchFullMsg && p.msgUrl && item.id){
+            try{
+              const msgResp=await _origFetch(p.msgUrl(emailData.address,item.id),{signal:AbortSignal.timeout(8000)});
+              const msgData=await msgResp.json();
+              body=msgData?.htmlBody||msgData?.body||msgData?.textBody||body;
+            }catch(e){ log(`[TempMail] Full msg fetch failed: ${e.message}`,'warn'); }
+          }
+          // Extract ALL links from the email body, prioritise verify/confirm/token links
+          const allLinks=[...body.matchAll(/https?:\/\/[^\s"<>']+/gi)].map(m=>m[0].replace(/&amp;/g,'&'));
+          const verifyLink=allLinks.find(l=>/verify|confirm|activate|token|validate|account/i.test(l))
+            || allLinks.find(l=>l.includes('click'))
+            || allLinks[0] || null;
+          log(`[TempMail] ✓ Match! Subject: "${item?.subject||item?.mail_subject||'(no subject)'}". Link: ${verifyLink?verifyLink.slice(0,70):'none found'}`,'ok');
+          return{found:true,item,verifyLink,body,attempt,allLinks};
         }
       }
-      log(`[TempMail] Attempt ${attempt}/${maxAttempts} — ${inbox.length} emails, no verify match`,'info');
-    }catch(e){log(`[TempMail] Poll error: ${e.message}`,'warn');}
+      log(`[TempMail] ${inbox.length} email(s) but no keyword match yet`,'info');
+    }catch(e){
+      log(`[TempMail] Poll attempt ${attempt} error: ${e.message}`,'warn');
+    }
   }
-  return{found:false,reason:'timeout_no_email'};
+  return{found:false,reason:`timeout after ${maxAttempts} attempts (${Math.round(maxAttempts*intervalMs/60000)}min)`};
 }
 
 // ── ACCOUNT CREATOR AUTOMATION ENGINE ────────────────────────────────────────
@@ -8710,20 +9351,43 @@ function ac_updatePipelineCard(a){
   const stageBadge = cardEl.querySelector('.ac-stage-badge');
   const stageMsg = cardEl.querySelector('.ac-stage-msg');
   const logEl = cardEl.querySelector('.ac-pipeline-log');
+  const credEl = cardEl.querySelector('.ac-credentials');
+  const actionsEl = cardEl.querySelector('.ac-actions');
+
   if(stageBadge){ stageBadge.textContent = stageData.icon + ' ' + stageData.label; stageBadge.style.color = stageData.color; }
   if(stageMsg){ stageMsg.textContent = a.pipelineMsg || ''; }
+
+  // Show credentials panel (always visible for easy copy)
+  if(credEl){
+    const pdata = AC_PLATFORMS[a.platform] || {};
+    credEl.innerHTML = `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-family:var(--mono);font-size:10px">
+        <div><span style="color:var(--text3)">user:</span> <strong style="color:var(--cyan)">${esc(a.username)}</strong></div>
+        <div><span style="color:var(--text3)">email:</span> <strong style="color:var(--yellow)">${esc(a.email||'—')}</strong></div>
+        <div><span style="color:var(--text3)">pass:</span> <strong style="color:var(--text)">${esc(a.password||'—')}</strong></div>
+        <div><span style="color:var(--text3)">platform:</span> <strong>${esc(a.platform)}</strong></div>
+      </div>
+      <div style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap">
+        ${pdata.url?`<a class="tbtn" style="font-size:9px;padding:2px 7px" href="${pdata.url}" target="_blank">🌐 Open Registration</a>`:''}
+        <button class="tbtn" style="font-size:9px;padding:2px 7px" onclick="navigator.clipboard.writeText('Username: ${a.username}\\nEmail: ${a.email||''} \\nPassword: ${a.password||''}').then(()=>log('Credentials copied','ok'))">📋 Copy Credentials</button>
+        ${a.isTempMail&&a.email?`<a class="tbtn" style="font-size:9px;padding:2px 7px" href="https://www.1secmail.com/?login=${a.email.split('@')[0]}&domain=${a.email.split('@')[1]}" target="_blank">📬 Open Inbox</a>`:''}
+        ${a.verifyLink?`<a class="tbtn go" style="font-size:9px;padding:2px 7px" href="${a.verifyLink}" target="_blank">✅ Open Verify Link</a>`:''}
+      </div>`;
+  }
+
   if(logEl){
     const entries = AC_PIPELINE_LOG[id] || [];
-    logEl.innerHTML = entries.slice(-6).map(e => {
+    logEl.innerHTML = entries.slice(-8).map(e => {
       const s = AC_PIPELINE_STAGES[e.stage] || {};
-      return `<div style="display:flex;gap:5px;align-items:baseline;padding:1px 0">
+      return `<div style="display:flex;gap:5px;align-items:baseline;padding:1px 0;border-bottom:1px solid #1a1a1a">
         <span style="font-size:9px;color:var(--text3);flex-shrink:0">${e.ts}</span>
         <span style="color:${s.color||'var(--text2)'};">${s.icon||'·'}</span>
-        <span style="font-size:10px;color:var(--text2)">${e.msg}</span>
-        ${e.link?`<a href="${e.link}" target="_blank" style="font-size:9px;color:var(--green);margin-left:auto;flex-shrink:0">🔗 Open</a>`:''}
+        <span style="font-size:10px;color:var(--text2);flex:1">${e.msg}</span>
+        ${e.link?`<a href="${e.link}" target="_blank" style="font-size:9px;color:var(--green);flex-shrink:0">🔗</a>`:''}
       </div>`;
     }).join('');
   }
+
   // Update verify button visibility
   const verifyBtn = cardEl.querySelector('.ac-verify-btn');
   if(verifyBtn){
@@ -8732,9 +9396,26 @@ function ac_updatePipelineCard(a){
   }
 }
 
-// ── FULL AUTOMATION PIPELINE ────────────────────────────────────────────────
+// ── FULL AUTOMATION PIPELINE ──────────────────────────────────────────────────
+// REAL WORKING LOGIC:
+// 1. Generate temp email via 1SecMail API (CORS-safe, no proxy needed)
+// 2. Open platform registration page in new tab (user registers using generated credentials)
+// 3. Poll inbox for verification email (real API polling, not simulation)
+// 4. When found, extract verify link and open it in new tab for the user
+// 5. Mark account as verified/saved
+//
+// WHY WE CAN'T FULLY AUTOMATE REGISTRATION:
+// Browser security prevents cross-origin form submission to third-party sites
+// (Same-Origin Policy). A real automation requires Puppeteer/Playwright running
+// server-side. This pipeline does everything possible in the browser:
+// generates credentials, copies them to clipboard, opens the registration page,
+// then monitors the inbox and surfaces the verification link automatically.
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function ac_runPipeline(account){
+  const pdata = AC_PLATFORMS[account.platform] || {};
+  const regUrl = pdata.url || null;
+
   // Step 1: Generate temp email if needed
   if(account.isTempMail && !account.email){
     ac_pipelineSetStage(account, 'registering', 'Generating temp-mail address...');
@@ -8743,37 +9424,53 @@ async function ac_runPipeline(account){
     account.tmpMailToken = tmpResult.token;
     account.tmpMailProviderIdx = tmpResult.providerIdx;
     account.tmpMailProvider = tmpResult.provider;
-    ac_pipelineLog(ac_pipelineId(account), 'registering', `Temp email: ${account.email} via ${tmpResult.provider}`);
+    ac_pipelineLog(ac_pipelineId(account), 'registering', `Email: ${account.email} via ${tmpResult.provider}`);
+    SS.set('rf_accounts', APP.accounts);
   }
 
-  // Step 2: Open registration page in background fetch (simulate registration attempt)
+  // Step 2: Copy credentials to clipboard and open registration page
   ac_pipelineSetStage(account, 'registering', `Opening ${account.platform} registration...`);
-  await sleep(rand(600, 1400));
+  const credBlock = `Username: ${account.username}\nEmail: ${account.email}\nPassword: ${account.password}${account.bio?'\nBio: '+account.bio:''}`;
+  try{ await navigator.clipboard.writeText(credBlock); } catch(e){}
 
-  // Step 3: Simulate form fill & submission (for real automation, this would drive a browser/iframe)
-  ac_pipelineSetStage(account, 'registering', `Filling registration form for ${account.username}...`);
-  await sleep(rand(800, 1800));
+  if(regUrl){
+    // Open registration page in a new tab
+    const win = window.open(regUrl, '_blank');
+    ac_pipelineLog(ac_pipelineId(account), 'registering',
+      `Registration page opened. Credentials copied to clipboard. Fill the form and submit.`,
+      regUrl);
+    log(`[${account.platform}] 📋 Credentials copied. Registration tab opened → fill & submit`, 'info');
+    // Show a helper notification in the pipeline card
+    account.pipelineMsg = `✏ Fill form: user=${account.username} | email=${account.email} | pass=${account.password}`;
+    ac_updatePipelineCard(account);
+  } else {
+    ac_pipelineLog(ac_pipelineId(account), 'registering', `No registration URL for ${account.platform} — add manually`);
+  }
 
-  const pdata = AC_PLATFORMS[account.platform] || {};
-
-  // Step 4: Check if email verify required
+  // Step 3: If platform doesn't require email verification, done
   if(pdata.emailVerify === false){
-    // No verification needed — go straight to saved
+    await sleep(rand(800, 1500)); // small UX delay
     account.emailVerified = true;
     account.status = 'registered';
-    ac_pipelineSetStage(account, 'saved', `Registered without email verify ✓`);
+    ac_pipelineSetStage(account, 'saved', `✓ ${account.platform} — no email verify required. Register then mark verified.`);
     return { success: true };
   }
 
-  // Step 5: Wait for verification email
+  // Step 4: Wait a moment for user to submit registration form, then start polling
   if(!account.isTempMail){
-    // Custom email — can't auto-verify, mark for manual
-    ac_pipelineSetStage(account, 'manual_verify', `Check ${account.email} for verification link`);
+    // Custom email — can't auto-poll, mark for manual
+    ac_pipelineSetStage(account, 'manual_verify',
+      `Check ${account.email} for verify email. Click the link then mark verified here.`);
     return { success: false, manual: true };
   }
 
-  // Step 6: Poll inbox for verification email
-  ac_pipelineSetStage(account, 'awaiting_verify', `Polling inbox: ${account.email}`);
+  // Step 5: Poll inbox for the verification email
+  // Wait a short time first so user has time to submit the form
+  const preWait = 8000; // 8 seconds to let user submit form
+  ac_pipelineSetStage(account, 'awaiting_verify',
+    `Waiting for you to submit form, then polling ${account.email}... (${preWait/1000}s head start)`);
+  await sleep(preWait);
+  if(APP.stopFlag) return { success: false, reason: 'stopped' };
 
   const emailData = {
     address: account.email,
@@ -8781,50 +9478,62 @@ async function ac_runPipeline(account){
     providerIdx: account.tmpMailProviderIdx || 0,
   };
 
+  const pollAttempts = parseInt(SS.raw('rf_ac_poll_attempts') || '20');
+  const pollInterval = parseInt(SS.raw('rf_ac_poll_interval') || '6') * 1000;
+
+  ac_pipelineSetStage(account, 'awaiting_verify',
+    `Polling inbox every ${pollInterval/1000}s (up to ${Math.round(pollAttempts*pollInterval/60000)}min)`);
+
   const pollResult = await ac_pollInbox(
     emailData,
-    ['verify', 'confirm', 'activate', 'welcome', 'click', 'complete'],
-    parseInt(SS.raw('rf_ac_poll_attempts') || '15'),
-    parseInt(SS.raw('rf_ac_poll_interval') || '5') * 1000,
+    ['verify', 'confirm', 'activate', 'welcome', 'click', 'complete', 'registration', 'account'],
+    pollAttempts,
+    pollInterval,
   );
 
   if(APP.stopFlag) return { success: false, reason: 'stopped' };
 
   if(!pollResult.found){
-    ac_pipelineSetStage(account, 'manual_verify', `Email not found after polling — verify manually`);
+    // Polling timed out — mark for manual verification
+    ac_pipelineSetStage(account, 'manual_verify',
+      `Email not found after polling (${pollResult.reason}). Click verify link manually when it arrives.`);
+    account.verifyLink = `https://www.1secmail.com/?login=${account.email.split('@')[0]}&domain=${account.email.split('@')[1]}`;
+    ac_updatePipelineCard(account);
     return { success: false, manual: true };
   }
 
-  // Step 7: Open verify link
-  ac_pipelineSetStage(account, 'verifying', `Verification email found! Opening link...`, pollResult.verifyLink);
+  // Step 6: Verification email found — open the link
+  ac_pipelineSetStage(account, 'verifying',
+    `✓ Email found (attempt ${pollResult.attempt})! Opening verification link...`,
+    pollResult.verifyLink);
 
   if(pollResult.verifyLink){
-    // Auto-open verification link
-    try{
-      const resp = await fetch(pollResult.verifyLink, {
-        method: 'GET',
-        signal: AbortSignal.timeout(12000),
-        mode: 'no-cors', // best-effort — CORS will block most, but triggers the verify
-      });
-      await sleep(rand(1000, 2000));
-      ac_pipelineSetStage(account, 'verifying', `Verification link opened — waiting for confirmation...`, pollResult.verifyLink);
-    } catch(e) {
-      // CORS blocked — still mark link as found for manual open
-      ac_pipelineSetStage(account, 'verifying', `Link found (open manually due to CORS)`, pollResult.verifyLink);
-    }
-    await sleep(rand(1500, 3000));
+    account.verifyLink = pollResult.verifyLink;
+    // Open verify link in new tab — this actually clicks the link
+    window.open(pollResult.verifyLink, '_blank');
+    log(`[${account.platform}] 🔗 Verification link opened automatically`, 'ok');
+    await sleep(rand(2000, 4000)); // give the verification server a moment
+  } else {
+    // No link found in email — show inbox for manual
+    const inboxUrl = `https://www.1secmail.com/?login=${account.email.split('@')[0]}&domain=${account.email.split('@')[1]}`;
+    account.verifyLink = inboxUrl;
+    window.open(inboxUrl, '_blank');
+    ac_pipelineSetStage(account, 'manual_verify',
+      `Email found but no verify link detected. Inbox opened — click manually.`, inboxUrl);
+    return { success: false, manual: true };
   }
 
-  // Step 8: Mark as verified and save
+  // Step 7: Mark as verified and save
+  await sleep(rand(1000, 2000));
   account.emailVerified = true;
   account.status = 'verified';
-  account.verifyLink = pollResult.verifyLink || null;
   account.verifiedDate = today();
-  ac_pipelineSetStage(account, 'saved', `✓ Account fully created and verified`);
+  ac_pipelineSetStage(account, 'saved', `✅ ${account.platform}/${account.username} — verified and saved!`);
 
   return { success: true, verifyLink: pollResult.verifyLink };
 }
 
+// ── BATCH PIPELINE RUNNER ───────────────────────────────────────────────────
 // ── BATCH PIPELINE RUNNER ───────────────────────────────────────────────────
 
 async function ac_runAutomation(){
@@ -9127,13 +9836,20 @@ function render_account_creator(el){
             </div>
           </div>
           <div class="panel-body" style="padding:8px">
-            <!-- Credentials row -->
-            <div style="display:grid;grid-template-columns:auto 1fr;gap:2px 8px;font-size:10px;margin-bottom:7px">
+            <!-- Credentials — always visible, easy to copy -->
+            <div class="ac-credentials" style="background:rgba(0,0,0,0.3);border:1px solid var(--win-border);border-radius:2px;padding:7px;margin-bottom:7px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:3px 8px;font-size:10px;font-family:var(--mono);margin-bottom:6px">
               <span style="color:var(--text3)">Email:</span>
               <span class="mono" style="color:var(--text);word-break:break-all">${esc(a.email||'generating...')}</span>
               <span style="color:var(--text3)">Password:</span>
               <span class="mono" style="color:var(--yellow)">${esc(a.password)}</span>
-              ${a.verifyLink ? `<span style="color:var(--text3)">Verify:</span><a href="${esc(a.verifyLink)}" target="_blank" class="ac-verify-btn" style="color:var(--cyan);font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">🔗 ${esc(a.verifyLink.slice(0,45))}…</a>` : ''}
+              ${a.verifyLink ? `<div style='grid-column:span 2'><span style='color:var(--text3)'>verify: </span><a href='${esc(a.verifyLink)}' target='_blank' class='ac-verify-btn' style='color:var(--cyan);font-size:9px'>🔗 ${esc(a.verifyLink.slice(0,50))}</a></div>` : ''}
+            </div>
+              <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px">
+                ${pdata.url ? `<a href="${esc(pdata.url)}" target="_blank" class="tbtn" style="text-decoration:none;font-size:9px;padding:2px 7px">🌐 Open Registration</a>` : ''}
+                <button class="tbtn" style="font-size:9px;padding:2px 7px" onclick="navigator.clipboard.writeText('Username: '+${JSON.stringify(a.username)}+'\nEmail: '+(${JSON.stringify(a.email||'')}||'')+'\nPassword: '+(${JSON.stringify(a.password||'')}||'')).then(()=>log('Credentials copied','ok'))">📋 Copy</button>
+                ${a.isTempMail&&a.email?`<a class="tbtn" style="font-size:9px;padding:2px 7px;text-decoration:none" href="https://www.1secmail.com/?login=${a.email.split('@')[0]}&domain=${a.email.split('@')[1]}" target="_blank">📬 Inbox</a>`:''}
+                ${a.verifyLink?`<a class="tbtn go" style="font-size:9px;padding:2px 7px;text-decoration:none" href="${esc(a.verifyLink)}" target="_blank">✅ Verify</a>`:''}
+              </div>
             </div>
             <!-- Status message -->
             <div class="ac-stage-msg" style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-bottom:6px;min-height:14px">${esc(a.pipelineMsg||'')}</div>
@@ -9141,11 +9857,11 @@ function render_account_creator(el){
             <div class="ac-pipeline-log" style="background:#0a0a0a;border-radius:2px;padding:5px 6px;min-height:36px;max-height:90px;overflow-y:auto;font-family:var(--mono)">
               ${logEntries.map(e => {
                 const s = AC_PIPELINE_STAGES[e.stage] || {};
-                return `<div style="display:flex;gap:5px;align-items:baseline;padding:1px 0">
+                return `<div style="display:flex;gap:5px;align-items:baseline;padding:1px 0;border-bottom:1px solid #111">
                   <span style="font-size:9px;color:var(--text3);flex-shrink:0">${e.ts}</span>
-                  <span style="color:${s.color||'var(--text2)'};">${s.icon||'·'}</span>
-                  <span style="font-size:10px;color:var(--text2)">${esc(e.msg)}</span>
-                  ${e.link ? `<a href="${esc(e.link)}" target="_blank" style="font-size:9px;color:var(--green);margin-left:auto;flex-shrink:0">🔗 Open</a>` : ''}
+                  <span style="color:${s.color||'var(--text2)'}">${s.icon||'·'}</span>
+                  <span style="font-size:10px;color:var(--text2);flex:1">${esc(e.msg)}</span>
+                  ${e.link ? `<a href="${esc(e.link)}" target="_blank" style="font-size:9px;color:var(--green);flex-shrink:0">🔗</a>` : ''}
                 </div>`;
               }).join('') || `<div style="color:var(--text3);font-size:9px">No activity yet</div>`}
             </div>
@@ -9156,7 +9872,7 @@ function render_account_creator(el){
               <button class="tbtn" style="font-size:9px" onclick="ac_copyCard_by_id('${CSS.escape(id)}')">📋 Copy</button>
               ${a.pipelineStage === 'manual_verify' || a.pipelineStage === 'awaiting_verify' ?
                 `<button class="tbtn go" style="font-size:9px" onclick="ac_manualMarkVerified_by_id('${CSS.escape(id)}')">✓ Mark Verified</button>` : ''}
-              ${a.isTempMail && (a.pipelineStage === 'manual_verify' || a.pipelineStage === 'awaiting_verify') ?
+              ${a.isTempMail && (a.pipelineStage === 'manual_verify' || a.pipelineStage === 'awaiting_verify' || a.pipelineStage === 'registering') ?
                 `<button class="tbtn" style="font-size:9px" onclick="ac_retryPoll_by_id('${CSS.escape(id)}')">🔄 Re-Poll Inbox</button>` : ''}
             </div>
           </div>
@@ -14509,58 +15225,60 @@ if(!window.PRX_CORS_STATUS) window.PRX_CORS_STATUS = {};
 
 // ── BACKWARDS-COMPAT ALLORIGINS WRAPPER ──
 // All existing code that uses allorigins.win now routes through the multi-CORS fallback chain
-// This makes ALL tools resilient to allorigins being down
+// This makes ALL tools resilient — Railway first, then CORS proxy chain fallback
 const _ALLORIGINS_BASE = 'https://api.allorigins.win/get?url=';
 const _origFetch = window.fetch;
-// Intercept fetch calls to allorigins and reroute through the fallback chain
+
+// Intercept fetch calls to allorigins and route through Railway or CORS chain
 window.fetch = async function(url, opts) {
   if(typeof url === 'string' && url.startsWith(_ALLORIGINS_BASE)) {
-    // Extract the actual target URL from the allorigins wrapper
     const targetUrl = decodeURIComponent(url.slice(_ALLORIGINS_BASE.length).split('&')[0]);
-    const timeout = opts?.signal?.timeout || 15000;
+    const timeout = 18000;
     try {
       const raw = await prx_corsGet(targetUrl, timeout);
-      // Return a fake Response that looks like allorigins response
       return new Response(JSON.stringify({contents: raw, status: {url: targetUrl, content_type:'text/html', http_code:200}}), {
-        status: 200,
-        headers: {'Content-Type': 'application/json'}
+        status: 200, headers: {'Content-Type': 'application/json'}
       });
     } catch(e) {
-      // Return error response
       return new Response(JSON.stringify({contents:'', status:{http_code:0}}), {
-        status: 200,
-        headers: {'Content-Type': 'application/json'}
+        status: 200, headers: {'Content-Type': 'application/json'}
       });
     }
   }
   return _origFetch.call(this, url, opts);
 };
 
-
 async function prx_corsGet(url, timeoutMs=18000){
-  // Try each CORS proxy in order; prefer last known-good
+  // ── RAILWAY FIRST (if configured) ──
+  if (RW.enabled) {
+    try {
+      const html = await RW.fetchPage(url, timeoutMs);
+      if (html && html.length > 20) return html;
+    } catch(e) {
+      log(`[Railway] fetch failed (${e.message}), falling back to CORS chain`, 'warn');
+    }
+  }
+  // ── CORS PROXY FALLBACK CHAIN ──
   const order = [...PRX_CORS_CHAIN].sort((a,b)=>{
     const sa = PRX_CORS_STATUS[a.name]||0;
     const sb = PRX_CORS_STATUS[b.name]||0;
-    return sb - sa; // Higher score first
+    return sb - sa;
   });
   let lastErr = null;
   for(const proxy of order){
     try{
-      const resp = await fetch(proxy.wrap(url), { signal: AbortSignal.timeout(timeoutMs) });
+      const resp = await _origFetch(proxy.wrap(url), { signal: AbortSignal.timeout(timeoutMs) });
       if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const raw = await proxy.extract(resp);
       if(!raw || raw.length < 10) throw new Error('empty body');
-      // Mark this proxy as recently successful
       PRX_CORS_STATUS[proxy.name] = (PRX_CORS_STATUS[proxy.name]||0) + 1;
       return raw;
     } catch(e){
-      // Penalize failing proxy
       PRX_CORS_STATUS[proxy.name] = Math.max(-5, (PRX_CORS_STATUS[proxy.name]||0) - 2);
       lastErr = e;
     }
   }
-  throw new Error(`All CORS proxies failed — last error: ${lastErr?.message}`);
+  throw new Error(`Railway + all CORS proxies failed — last error: ${lastErr?.message}`);
 }
 
 async function prx_fetchSource(source){
@@ -16945,30 +17663,62 @@ function render_settings(el){
 function _sKeysTab(){
   return `<div class="notice ni-b" style="margin-bottom:10px">All keys stored in <b>your browser only</b> (localStorage). Connect Supabase below to sync across devices. Export settings before clearing browser data.</div>
   <div class="g3">
-    <div class="panel">
-      <div class="panel-head">🟢 Supabase Backend (Real-time Sync)</div>
+    <div class="panel" style="border:2px solid var(--green)">
+      <div class="panel-head" style="background:linear-gradient(90deg,rgba(57,211,83,0.1),transparent)">🚂 Railway Backend <span id="rw-badge" class="badge" style="margin-left:4px;background:${localStorage.getItem('rf_railway_url')?'rgba(57,211,83,0.2)':'rgba(100,100,100,0.2)'}">${localStorage.getItem('rf_railway_url')?'● Configured':'○ Not set'}</span></div>
       <div class="panel-body">
-        <div class="notice ni-b" style="margin-bottom:8px;font-size:10px">Connect Supabase to sync all your data across devices in real-time. <a href="https://supabase.com" target="_blank" style="color:var(--blue)">Free at supabase.com</a> — no credit card needed.</div>
-        <div class="fg">
-          <label class="lbl">Supabase Project URL</label>
-          <input type="text" id="s-sb-url" value="${SS.raw('rf_sb_url')}" placeholder="https://xxxx.supabase.co" onchange="SS.rawSet('rf_sb_url',this.value)"/>
-          <div class="mono xs tm" style="margin-top:2px">Find in: Supabase Dashboard → Project Settings → API → Project URL</div>
+        <div class="notice ni-g" style="margin-bottom:8px;font-size:10px">
+          <strong style="color:var(--green)">Railway = HTTP execution engine.</strong> Routes ALL fetch/POST requests server-side — real cookies, sessions, no CORS. <strong>Supabase = data storage only.</strong> Both work together.
         </div>
         <div class="fg">
-          <label class="lbl">Supabase Anon Key (public)</label>
-          <input type="password" id="s-sb-anon" value="${SS.raw('rf_sb_anon')}" placeholder="eyJhbGciOiJIUzI1NiIs..." onchange="SS.rawSet('rf_sb_anon',this.value)"/>
-          <div class="mono xs tm" style="margin-top:2px">Find in: Supabase Dashboard → Project Settings → API → anon public key</div>
+          <label class="lbl">Railway Server URL</label>
+          <input type="text" id="s-rw-url" value="${localStorage.getItem('rf_railway_url')||''}" placeholder="https://yourapp.up.railway.app"
+            oninput="RW.url=this.value.trim()"/>
+          <div class="mono xs tm" style="margin-top:2px">Deploy the backend → copy URL from Railway dashboard → paste here</div>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
-          <button class="tbtn go" onclick="sbInit();render_settings(document.getElementById('page-settings'))">🔗 Connect Supabase</button>
-          <button class="tbtn" onclick="sbStatus().then(s=>log('Supabase status: '+s, s==='connected'?'ok':'warn'))">📡 Test Connection</button>
-          <button class="tbtn" onclick="sbSyncFromCloud()">⬇ Pull from Cloud</button>
-          <button class="tbtn" onclick="sbPushAll()">⬆ Push All to Cloud</button>
+          <button class="tbtn go" onclick="
+            const u=document.getElementById('s-rw-url').value.trim();
+            if(!u){log('Enter Railway URL first','err');return;}
+            RW.url=u;
+            RW.test().then(ok=>{
+              log('Railway: '+(ok?'✓ Connected and working':'✗ Cannot reach — check URL and that server is deployed'), ok?'ok':'err');
+              const b=document.getElementById('rw-badge');
+              if(b){b.textContent=ok?'● Connected':'✗ Error';b.style.background=ok?'rgba(57,211,83,0.2)':'rgba(224,82,82,0.2)';}
+            })">📡 Test Connection</button>
+          <button class="tbtn" onclick="window.open('https://railway.app','_blank')">🚂 Open Railway</button>
         </div>
-        <div style="margin-top:6px;font-size:10px;color:var(--text3)">Status: <span id="sb-status-lbl" style="color:${_supabaseClient?'var(--green)':'var(--text3)'}">${_supabaseClient?'● Connected':'○ Not connected'}</span></div>
+        <div style="margin-top:8px;padding:8px;background:var(--win-bg);border:1px solid var(--win-border);border-radius:2px;font-size:10px;color:var(--text3);line-height:1.8">
+          <strong style="color:var(--text2)">5-minute setup:</strong><br>
+          1. Get <code style="color:var(--cyan)">server.js</code> + <code style="color:var(--cyan)">package.json</code> files (from your download)<br>
+          2. Push to a new GitHub repo<br>
+          3. <a href="https://railway.app" target="_blank" style="color:var(--blue)">railway.app</a> → New Project → Deploy from GitHub → select repo<br>
+          4. Railway builds automatically → Settings → Networking → Generate Domain<br>
+          5. Copy the URL (e.g. <code>https://yourapp.up.railway.app</code>) → paste above
+        </div>
       </div>
     </div>
     <div class="panel">
+      <div class="panel-head">🟢 Supabase (Data Sync)</div>
+      <div class="panel-body">
+        <div class="notice ni-b" style="margin-bottom:8px;font-size:10px">Supabase syncs settings &amp; results across devices. <a href="https://supabase.com" target="_blank" style="color:var(--blue)">Free at supabase.com</a></div>
+        <div class="fg">
+          <label class="lbl">Supabase Project URL</label>
+          <input type="text" id="s-sb-url" value="${SS.raw('rf_sb_url')}" placeholder="https://xxxx.supabase.co" onchange="SS.rawSet('rf_sb_url',this.value)"/>
+        </div>
+        <div class="fg">
+          <label class="lbl">Supabase Anon Key</label>
+          <input type="password" id="s-sb-anon" value="${SS.raw('rf_sb_anon')}" placeholder="eyJhbGciOiJIUzI1NiIs..." onchange="SS.rawSet('rf_sb_anon',this.value)"/>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+          <button class="tbtn go" onclick="sbInit();render_settings(document.getElementById('page-settings'))">🔗 Connect</button>
+          <button class="tbtn" onclick="sbStatus().then(s=>log('Supabase: '+s,s==='connected'?'ok':'warn'))">📡 Test</button>
+          <button class="tbtn" onclick="sbSyncFromCloud()">⬇ Pull</button>
+          <button class="tbtn" onclick="sbPushAll()">⬆ Push All</button>
+        </div>
+        <div style="margin-top:4px;font-size:10px;color:var(--text3)">Status: <span style="color:${_supabaseClient?'var(--green)':'var(--text3)'}"> ${_supabaseClient?'● Connected':'○ Not connected'}</span></div>
+      </div>
+    </div>
+<div class="panel">
       <div class="panel-head">🤖 Content & AI</div>
       <div class="panel-body">
         <div class="fg">

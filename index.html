@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -564,6 +566,9 @@ a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}
 </div>
 
 <script>
+// _origFetch must be declared FIRST — used by RW, prx_corsGet, bc_rawProxyPost etc.
+const _origFetch = window.fetch;
+
 // ═══════════════════════════════════════════════════
 // CORE APP STATE
 // ═══════════════════════════════════════════════════
@@ -5372,7 +5377,7 @@ function bc_extractForm(html, pageUrl) {
 // Does NOT return ok:true/false — callers interpret the response text.
 const BC_POST_PROXIES = [
   { name: 'corsproxy.io',  wrap: u => `https://corsproxy.io/?${encodeURIComponent(u)}`,              headers: c => ({ 'Content-Type': c, 'X-Requested-With': 'XMLHttpRequest' }) },
-  { name: 'allorigins',    wrap: u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, headers: c => ({ 'Content-Type': c }) },
+  { name: 'cors.sh',       wrap: u => `https://proxy.cors.sh/${u}`,                                   headers: c => ({ 'Content-Type': c, 'x-cors-api-key': 'temp_' }) },
 ];
 
 async function bc_rawProxyPost(targetUrl, body, contentType, timeoutMs = 15000) {
@@ -5552,10 +5557,15 @@ async function bc_formPost(formData, actionUrl, captchaToken, cms = 'generic') {
   Object.entries(formData.fields || {}).forEach(([k, v]) => params.set(k, v));
   if (captchaToken) params.set('g-recaptcha-response', captchaToken);
 
-  const { sent, text, proxy } = await bc_rawProxyPost(actionUrl, params.toString(), 'application/x-www-form-urlencoded', 16000);
+  const { sent, text, proxy, httpStatus } = await bc_rawProxyPost(actionUrl, params.toString(), 'application/x-www-form-urlencoded', 16000);
   if (!sent) return { ok: false, method: 'form_post', reason: 'proxy_transport_failed' };
 
-  log(`[FormPOST] ${proxy} response preview: ${text.slice(0, 150).replace(/\s+/g, ' ')}`, 'info');
+  log(`[FormPOST] ${proxy} HTTP ${httpStatus} response preview: ${text.slice(0, 150).replace(/\s+/g, ' ')}`, 'info');
+
+  // 3xx redirect from proxy often means the server accepted and redirected back — treat as likely success
+  if (httpStatus >= 301 && httpStatus <= 303) {
+    return { ok: true, method: 'form_post', reason: 'redirect_likely_success' };
+  }
 
   // ── Parse response — explicit signals ONLY, no catch-all status:200 ──
   if (/duplicate|already.*comment|you.*already said/i.test(text))
@@ -5579,27 +5589,7 @@ async function bc_formPost(formData, actionUrl, captchaToken, cms = 'generic') {
 }
 
 // ── FORM EXTRACTORS ───────────────────────────────────────────────────────
-function bc_extractForm(html, pageUrl) {
-  const result = { action: null, postId: null, nonce: null, fields: {}, method: 'POST' };
-  try {
-    const actionMatch =
-      html.match(/action="([^"]*wp-comments-post\.php[^"]*)"/i) ||
-      html.match(/<form[^>]+id="commentform"[^>]*action="([^"]+)"/i) ||
-      html.match(/<form[^>]+class="[^"]*comment[^"]*"[^>]*action="([^"]+)"/i);
-    if (actionMatch) result.action = actionMatch[1].startsWith('http') ? actionMatch[1] : new URL(actionMatch[1], pageUrl).href;
-    else { try { result.action = new URL('/wp-comments-post.php', pageUrl).href; } catch {} }
-
-    const pidMatch = html.match(/name="comment_post_ID"\s+value="(\d+)"/i) || html.match(/comment_post_ID[^>]*value="(\d+)"/i);
-    if (pidMatch) result.postId = pidMatch[1];
-
-    const nonceMatch = html.match(/name="_wpnonce"\s+value="([^"]+)"/i) || html.match(/"nonce":"([^"]+)"/);
-    if (nonceMatch) result.nonce = nonceMatch[1];
-
-    const hiddens = [...html.matchAll(/input[^>]+type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi)];
-    hiddens.forEach(m => { result.fields[m[1]] = m[2]; });
-  } catch {}
-  return result;
-}
+// bc_extractForm is defined earlier (around line 5320) — no duplicate needed here.
 
 function bc_extractGenericForm(html, pageUrl) {
   const result = { action: null, fields: {}, detectedFieldNames: [], method: 'POST' };
@@ -6236,9 +6226,10 @@ function bc_retryFailed() {
       retried++;
     }
   });
+  if (!retried) { log('No failed items to retry', 'warn'); return; }
   SS.set('rf_bc_queue', queue);
-  render_commenter(document.getElementById('page-commenter'));
-  log(`${retried} failed items reset for retry`, 'ok');
+  log(`${retried} failed items reset — resuming queue...`, 'ok');
+  bc_resumeQueue();
 }
 
 function bc_exportQueue() {
@@ -15613,7 +15604,7 @@ if(!window.PRX_CORS_STATUS) window.PRX_CORS_STATUS = {};
 // All existing code that uses allorigins.win now routes through the multi-CORS fallback chain
 // This makes ALL tools resilient — Railway first, then CORS proxy chain fallback
 const _ALLORIGINS_BASE = 'https://api.allorigins.win/get?url=';
-const _origFetch = window.fetch;
+// NOTE: _origFetch is declared at top of script — do NOT redeclare here.
 
 // Intercept fetch calls to allorigins and route through Railway or CORS chain
 window.fetch = async function(url, opts) {

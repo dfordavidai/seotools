@@ -1062,6 +1062,8 @@ const S = {
   keywords: [],
   links: [],
   campaigns: [],
+  // Content override — persists across campaign/blast, covers all field types
+  contentOverride: { title:'', body:'', tags:'', category:'', excerpt:'', slug:'', format:'markdown', visibility:'public' },
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -1229,6 +1231,225 @@ function generateMarkdown(kw, links, tplIdx, allKws, username, domain){
   return content;
 }
 
+// Returns all content fields, using user overrides if set, else smart auto-generated defaults.
+// Supports: title, body, tags, category, excerpt, slug, format, visibility.
+// {keyword} / {kw} / {year} are substituted everywhere.
+function getEffectiveContent(kw, links, tplIdx, allKws, username, domain){
+  const autoBody  = generateMarkdown(kw, links, tplIdx, allKws, username, domain);
+  const autoTitle = kw + ': Complete Guide ' + year();
+  const autoSlug  = slug(kw);
+  const autoExcerpt = 'Comprehensive guide to ' + kw + '. Expert tips, best practices & resources for ' + year() + '.';
+  const ov = S.contentOverride || {};
+  const fillKw = s => (s||'').replace(/\{keyword\}/gi, kw).replace(/\{kw\}/gi, kw).replace(/\{year\}/gi, year()).replace(/\{slug\}/gi, slug(kw));
+  return {
+    title:      ov.title      && ov.title.trim()      ? fillKw(ov.title)      : autoTitle,
+    body:       ov.body       && ov.body.trim()        ? fillKw(ov.body)       : autoBody,
+    tags:       ov.tags       && ov.tags.trim()        ? fillKw(ov.tags)       : 'seo,guide,' + slug(kw),
+    category:   ov.category   && ov.category.trim()    ? fillKw(ov.category)   : 'General',
+    excerpt:    ov.excerpt    && ov.excerpt.trim()      ? fillKw(ov.excerpt)    : autoExcerpt,
+    slug:       ov.slug       && ov.slug.trim()         ? fillKw(ov.slug)       : autoSlug,
+    format:     ov.format     || 'markdown',
+    visibility: ov.visibility || 'public',
+  };
+}
+
+// ── CONTENT FIELDS SCHEMA ─────────────────────────────────────
+// Defines which fields each platform TYPE shows in the content card.
+// Add new platform types here — renderContentFields() picks it up automatically.
+const CONTENT_FIELDS = {
+  // Paste / anonymous page sites
+  paste: [
+    { id:'title',    label:'Title',            type:'text',     ph:'{keyword} Guide {year}',                         hint:'Page title. {keyword} inserts the current keyword.',       defVal:'' },
+    { id:'body',     label:'Content (Markdown)',type:'textarea', ph:'Write your content here in Markdown…\n\nUse {keyword} to inject keyword dynamically.',hint:'Full paste body. Leave blank for auto-generated SEO template.',defVal:'' },
+  ],
+  // Generic article / blog CMS
+  article: [
+    { id:'title',    label:'Post Title',        type:'text',     ph:'Best {keyword} Guide for {year}',               hint:'Post title shown in browser & SERPs.',                     defVal:'' },
+    { id:'body',     label:'Post Body (Markdown)',type:'textarea',ph:'Write your post here…\n\nUse {keyword} for dynamic injection.',hint:'Full article body. Leave blank for auto-template.',      defVal:'' },
+    { id:'tags',     label:'Tags',              type:'text',     ph:'seo,guide,marketing',                           hint:'Comma-separated tags. Applied to post.',                   defVal:'' },
+    { id:'excerpt',  label:'Excerpt / Description',type:'text',  ph:'Short summary of the post — {keyword} explained.',hint:'Used as meta description and post summary.',              defVal:'' },
+  ],
+  // Community / forum / Q&A posts
+  post: [
+    { id:'title',    label:'Post / Thread Title',type:'text',    ph:'{keyword}: Questions, Tips & Discussion',       hint:'Thread or post title.',                                   defVal:'' },
+    { id:'body',     label:'Post Body',          type:'textarea',ph:'Start the discussion about {keyword}…',         hint:'Post body. {keyword} injected dynamically.',              defVal:'' },
+    { id:'category', label:'Category / Forum',   type:'text',    ph:'General',                                       hint:'Forum section or post category. Leave blank for default.',defVal:'' },
+    { id:'tags',     label:'Tags / Flair',       type:'text',    ph:'seo,{keyword}',                                 hint:'Post tags or Reddit flair text.',                         defVal:'' },
+  ],
+  // Full CMS with all options (WordPress, Ghost, Hashnode, Wix…)
+  cms: [
+    { id:'title',    label:'Post Title',         type:'text',    ph:'Best {keyword} Guide for {year}',               hint:'SEO-optimized title. {keyword} and {year} supported.',    defVal:'' },
+    { id:'body',     label:'Post Body (Markdown)',type:'textarea',ph:'Write your full post here in Markdown…',        hint:'Full article body. Auto-generated if left blank.',         defVal:'' },
+    { id:'tags',     label:'Tags',               type:'text',    ph:'seo,guide,{keyword}',                           hint:'Comma-separated post tags.',                              defVal:'' },
+    { id:'category', label:'Category',           type:'text',    ph:'General',                                       hint:'Post category. Must match an existing category on your site.',defVal:'' },
+    { id:'excerpt',  label:'Excerpt / Meta Desc',type:'text',    ph:'Learn everything about {keyword} in {year}.',   hint:'Short description used in SERPs and post previews.',      defVal:'' },
+    { id:'slug',     label:'URL Slug',           type:'text',    ph:'{slug}',                                        hint:'Custom URL slug. Leave blank to auto-generate from keyword.',defVal:'' },
+    { id:'visibility',label:'Visibility',        type:'select',  choices:['public','private','unlisted'],             hint:'Post visibility.',                                        defVal:'public' },
+  ],
+  // File/page builder platforms (GitHub Pages, Netlify, Vercel…)
+  file: [
+    { id:'title',    label:'Page Title (H1 + <title>)',type:'text',ph:'{keyword} — Complete Guide {year}',           hint:'Used as HTML <title>, H1, and README heading.',           defVal:'' },
+    { id:'body',     label:'Page Body (Markdown)',type:'textarea',ph:'Write your page content…',                     hint:'README.md and index.html content body. Auto if blank.',   defVal:'' },
+    { id:'excerpt',  label:'Meta Description',  type:'text',     ph:'Everything about {keyword} for {year}.',       hint:'HTML meta description for SEO.',                          defVal:'' },
+  ],
+  // Document / PDF draft platforms
+  doc: [
+    { id:'title',    label:'Document Title',    type:'text',     ph:'{keyword} — Complete Reference {year}',        hint:'Document title displayed in platform library.',           defVal:'' },
+    { id:'body',     label:'Document Description',type:'textarea',ph:'A comprehensive guide to {keyword}…',         hint:'Summary/description shown in platform listing.',          defVal:'' },
+    { id:'tags',     label:'Tags',              type:'text',     ph:'seo,guide,{keyword}',                          hint:'Comma-separated document tags.',                          defVal:'' },
+  ],
+  // Prefill/manual (CodePen etc)
+  prefill: [
+    { id:'title',    label:'Page Title',        type:'text',     ph:'{keyword} — Live Demo {year}',                 hint:'Title shown in the editor prefill.',                      defVal:'' },
+    { id:'body',     label:'HTML Body Content', type:'textarea', ph:'<h1>{keyword}</h1>\n<p>Your content here…</p>',hint:'HTML content injected into the prefill template.',        defVal:'' },
+  ],
+};
+
+// Map PLATFORM_META types to CONTENT_FIELDS keys
+const TYPE_TO_FIELDS = {
+  page:    'paste',
+  article: 'article',
+  post:    'post',
+  file:    'file',
+  doc:     'doc',
+  prefill: 'prefill',
+  cms:     'cms',
+};
+
+// For Global Blast which mixes platform types: detect dominant type among selected platforms
+// and show the superset of fields (cms has the most fields, so use it when types differ)
+function blastDominantFieldType(){
+  const types = _blastSelectedPlatforms.map(pid => {
+    const meta = PLATFORM_META[pid];
+    return meta ? meta.type : 'article';
+  });
+  // Priority: if any cms selected, show cms (most fields). Then article, then post, then paste/file
+  if(types.includes('cms'))     return 'cms';
+  if(types.includes('article')) return 'article';
+  if(types.includes('post'))    return 'post';
+  if(types.includes('file'))    return 'file';
+  if(types.includes('doc'))     return 'doc';
+  return types[0] || 'article';
+}
+
+// Render the dynamic content fields card for a given platform id.
+// Works for individual campaign page AND global blast.
+// prefix = 'camp' or 'blast' — used for element IDs to avoid collisions.
+function renderContentFields(pid, prefix){
+  prefix = prefix || 'camp';
+  const meta  = PLATFORM_META[pid] || { type:'article' };
+  const fkey  = TYPE_TO_FIELDS[meta.type] || 'article';
+  const fields = CONTENT_FIELDS[fkey] || CONTENT_FIELDS.article;
+  const ov    = S.contentOverride || {};
+
+  const typeLabel = {
+    paste:'Paste / Page', article:'Article / Blog', post:'Forum / Community',
+    file:'File / Subdomain', doc:'Document Draft', prefill:'Prefill URL', cms:'Full CMS'
+  }[fkey] || 'Content';
+
+  const fieldHtml = fields.map(f => {
+    const val = esc(ov[f.id] !== undefined ? ov[f.id] : f.defVal || '');
+    const onInput = `S.contentOverride['${f.id}']=this.value;contentFieldsPreview('${prefix}')`;
+    if(f.type === 'textarea'){
+      return `<div class="fg">
+        <label class="lbl">${esc(f.label)} <span class="tm">(leave blank for auto-generated)</span></label>
+        <textarea id="${prefix}-cf-${f.id}" rows="7" placeholder="${esc(f.ph)}"
+          oninput="${onInput}"
+          style="font-family:var(--mono);font-size:11px;resize:vertical">${val}</textarea>
+        ${f.hint ? `<p class="xs mono tm" style="margin-top:3px">${esc(f.hint)}</p>` : ''}
+      </div>`;
+    } else if(f.type === 'select'){
+      const opts = f.choices.map(c => `<option value="${esc(c)}" ${(ov[f.id]||f.defVal)===c?'selected':''}>${esc(c)}</option>`).join('');
+      return `<div class="fg mb0">
+        <label class="lbl">${esc(f.label)}</label>
+        <select id="${prefix}-cf-${f.id}" onchange="${onInput}">${opts}</select>
+        ${f.hint ? `<p class="xs mono tm" style="margin-top:3px">${esc(f.hint)}</p>` : ''}
+      </div>`;
+    } else {
+      return `<div class="fg mb0">
+        <label class="lbl">${esc(f.label)} <span class="tm">(leave blank for auto)</span></label>
+        <input type="text" id="${prefix}-cf-${f.id}" placeholder="${esc(f.ph)}" value="${val}"
+          oninput="${onInput}"/>
+        ${f.hint ? `<p class="xs mono tm" style="margin-top:3px">${esc(f.hint)}</p>` : ''}
+      </div>`;
+    }
+  }).join('\n');
+
+  // Preview panel
+  const previewHtml = `
+    <div id="${prefix}-cf-preview" style="display:none;margin-top:10px;border:1px solid var(--border);border-radius:6px;padding:10px;background:var(--win-surface)">
+      <div class="card-title" style="font-size:10px;margin-bottom:6px">📄 Content Preview <span class="mono tm xs" id="${prefix}-cf-preview-kw"></span></div>
+      <div style="margin-bottom:6px"><span class="badge badge-b" style="font-size:9px">TITLE</span>
+        <span class="mono xs ta" style="margin-left:6px;font-weight:700" id="${prefix}-cf-preview-title"></span></div>
+      <div style="margin-bottom:4px"><span class="badge badge-p" style="font-size:9px">TAGS</span>
+        <span class="mono xs tm" style="margin-left:6px" id="${prefix}-cf-preview-tags"></span></div>
+      <div style="margin-bottom:4px"><span class="badge badge-y" style="font-size:9px">CAT</span>
+        <span class="mono xs tm" style="margin-left:6px" id="${prefix}-cf-preview-category"></span></div>
+      <div style="margin-bottom:8px"><span class="badge badge-g" style="font-size:9px">EXCERPT</span>
+        <span class="mono xs tm" style="margin-left:6px" id="${prefix}-cf-preview-excerpt"></span></div>
+      <pre id="${prefix}-cf-preview-body" style="background:var(--term-bg);color:var(--term-text);font-family:var(--mono);font-size:10px;padding:10px;border-radius:6px;max-height:220px;overflow-y:auto;white-space:pre-wrap;line-height:1.6;margin:0"></pre>
+    </div>`;
+
+  return `<div class="card">
+    <div class="card-title flex aic g8">
+      ✏️ Post Content
+      <span class="badge badge-p" style="font-size:9px;margin-left:4px">${esc(typeLabel)}</span>
+      <span class="badge badge-b" style="font-size:9px">Use {keyword} · {year} · {slug} as placeholders</span>
+      <button class="btn btn-ghost btn-xs" style="margin-left:auto" onclick="contentFieldsReset('${prefix}')">↺ Auto</button>
+      <button class="btn btn-ghost btn-xs" onclick="contentFieldsTogglePreview('${prefix}')">👁 Preview</button>
+    </div>
+    ${fieldHtml}
+    ${previewHtml}
+  </div>`;
+}
+
+function contentFieldsPreview(prefix){
+  const wrap = document.getElementById(prefix+'-cf-preview');
+  if(!wrap || wrap.style.display === 'none') return; // only update if visible
+  const kw = (prefix==='blast'
+    ? (document.getElementById('blast-kw')||{value:''}).value.trim()
+    : null) || S.keywords[0] || 'your-keyword';
+  const ec = getEffectiveContent(kw, S.links, 0, S.keywords, 'user', 'site.com');
+  const set = (id, val) => { const el = document.getElementById(prefix+'-cf-preview-'+id); if(el) el.textContent = val || '—'; };
+  set('kw',      '(keyword: "' + kw + '")');
+  set('title',   ec.title);
+  set('tags',    ec.tags);
+  set('category',ec.category);
+  set('excerpt', ec.excerpt);
+  const bodyEl = document.getElementById(prefix+'-cf-preview-body');
+  if(bodyEl) bodyEl.textContent = ec.body.slice(0,1400) + (ec.body.length > 1400 ? '\n…(truncated)' : '');
+}
+
+function contentFieldsTogglePreview(prefix){
+  const wrap = document.getElementById(prefix+'-cf-preview');
+  if(!wrap) return;
+  const shown = wrap.style.display !== 'none';
+  wrap.style.display = shown ? 'none' : 'block';
+  if(!shown) contentFieldsPreview(prefix);
+}
+
+function contentFieldsReset(prefix){
+  S.contentOverride = { title:'', body:'', tags:'', category:'', excerpt:'', slug:'', format:'markdown', visibility:'public' };
+  // Reset all field inputs for this prefix's platform type
+  const _type = prefix==='blast' ? blastDominantFieldType() : (PLATFORM_META[S.activePlatform]?.type||'article');
+  const fields = CONTENT_FIELDS[TYPE_TO_FIELDS[_type]||'article'] || [];
+  fields.forEach(f => {
+    const el = document.getElementById(prefix+'-cf-'+f.id);
+    if(el) el.value = f.defVal || '';
+  });
+  contentFieldsPreview(prefix);
+  toast('Reset to auto-generated content', 's');
+}
+
+// Sync all content fields from DOM into S.contentOverride at run-time
+function syncContentFields(prefix){
+  const allFieldIds = ['title','body','tags','category','excerpt','slug','format','visibility'];
+  allFieldIds.forEach(id => {
+    const el = document.getElementById(prefix+'-cf-'+id);
+    if(el !== null) S.contentOverride[id] = el.value !== undefined ? el.value : el.textContent || '';
+  });
+}
+
 function generateHtmlPage(kw, username, repoName, links, platform){
   const p = getPlatform(platform);
   const baseUrl = platform==='github' ? `https://${username}.github.io/${repoName}/`
@@ -1267,13 +1488,120 @@ ${linkSection}
 }
 
 // ═══════════════════════════════════════════════════════════════
+// SMART FETCH — Universal auto-proxy wrapper
+// Tries the request direct first. If blocked by CORS or network
+// error, automatically retries through the full proxy pool.
+// Use this everywhere instead of raw fetch() for cross-origin
+// requests. Credential-bearing platform API calls (GitHub, Netlify,
+// Cloudflare etc.) are tried direct first so auth headers are never
+// forwarded to third-party proxies unless the direct call fails.
+// ═══════════════════════════════════════════════════════════════
+const _SF_CORS_DOMAINS = new Set(); // domains confirmed to need proxy
+
+async function smartFetch(url, opts = {}) {
+  const timeout  = opts.sfTimeout || opts.timeout || 16000;
+  const isPost   = !!(opts.method && opts.method.toUpperCase() !== 'GET');
+  const enc      = encodeURIComponent(url);
+  const mkSignal = () => (typeof AbortSignal !== 'undefined' && AbortSignal.timeout)
+    ? AbortSignal.timeout(timeout)
+    : (() => { const c = new AbortController(); setTimeout(() => c.abort(), timeout); return c.signal; })();
+
+  // Build proxy candidate list (same pool as bcProxyFetch / bcGetProxyList)
+  function proxyList() {
+    const cp        = (typeof _bcCustomProxy  !== 'undefined' ? _bcCustomProxy  : '').trim();
+    const userProxy = (typeof settingGet      === 'function'  ? settingGet('corsProxy') || '' : '').trim();
+    const out = [];
+    if (cp)        out.push({ url: cp.replace('{URL}',enc).replace('{url}',enc) || `${cp}?url=${enc}`,  passBody:isPost, label:'custom' });
+    if (userProxy) out.push({ url: userProxy + enc,                                                      passBody:isPost, label:'settings-proxy' });
+    if (isPost) {
+      out.push(
+        { url:`https://corsproxy.io/?${enc}`,                     passBody:true, label:'corsproxy' },
+        { url:`https://proxy.cors.sh/${url}`,                     passBody:true, label:'cors.sh', extraHeaders:{'x-cors-api-key':'temp_'} },
+        { url:`https://api.allorigins.win/raw?url=${enc}`,        passBody:true, label:'allorigins-raw' },
+        { url:`https://thingproxy.freeboard.io/fetch/${url}`,     passBody:true, label:'thingproxy' },
+        { url:`https://crossorigin.me/${url}`,                    passBody:true, label:'crossorigin' },
+        { url:`https://cors-anywhere-demo.herokuapp.com/${url}`,  passBody:true, label:'heroku' },
+        { url:`https://yacdn.org/serve/${url}`,                   passBody:true, label:'yacdn' },
+      );
+    } else {
+      out.push(
+        { url:`https://api.allorigins.win/get?url=${enc}`,        json:true,  passBody:false, label:'allorigins' },
+        { url:`https://corsproxy.io/?${enc}`,                     passBody:false, label:'corsproxy' },
+        { url:`https://api.allorigins.win/raw?url=${enc}`,        passBody:false, label:'allorigins-raw' },
+        { url:`https://proxy.cors.sh/${url}`,                     passBody:false, label:'cors.sh', extraHeaders:{'x-cors-api-key':'temp_'} },
+        { url:`https://thingproxy.freeboard.io/fetch/${url}`,     passBody:false, label:'thingproxy' },
+        { url:`https://api.codetabs.com/v1/proxy?quest=${enc}`,   passBody:false, label:'codetabs' },
+        { url:`https://crossorigin.me/${url}`,                    passBody:false, label:'crossorigin.me' },
+        { url:`https://yacdn.org/serve/${url}`,                   passBody:false, label:'yacdn' },
+        { url:`https://cors.eu.org/${url}`,                       passBody:false, label:'cors.eu.org' },
+        { url:`https://corsproxy.org/?${enc}`,                    passBody:false, label:'corsproxy.org' },
+        { url:`https://corsproxy.club/?${url}`,                   passBody:false, label:'corsproxy.club' },
+      );
+    }
+    return out;
+  }
+
+  // One fetch attempt (direct or via proxy)
+  async function attempt(fetchUrl, extraHeaders, passBody) {
+    const fo = {
+      method:  opts.method || 'GET',
+      headers: { ...(opts.headers || {}), ...(extraHeaders || {}) },
+      signal:  mkSignal(),
+    };
+    if (passBody !== false && opts.body != null) fo.body = opts.body;
+    if (opts.credentials) fo.credentials = opts.credentials;
+    return fetch(fetchUrl, fo);
+  }
+
+  const domain     = (() => { try { return new URL(url).hostname; } catch(e) { return url; } })();
+  const skipDirect = _SF_CORS_DOMAINS.has(domain);
+
+  // ── 1. Direct attempt (skipped if domain already known to block CORS) ──
+  if (!skipDirect) {
+    try {
+      const resp = await attempt(url, {}, true);
+      return resp; // success — real HTTP response even if 4xx/5xx
+    } catch (err) {
+      const isCorsErr = err instanceof TypeError ||
+        String(err).includes('Failed to fetch') ||
+        String(err).includes('NetworkError')    ||
+        String(err).includes('Load failed')     ||
+        String(err).includes('CORS');
+      if (isCorsErr) {
+        _SF_CORS_DOMAINS.add(domain); // remember: always proxy this domain
+      } else {
+        throw err; // real abort / programmer error — surface it
+      }
+    }
+  }
+
+  // ── 2. Proxy cascade ──
+  for (const proxy of proxyList()) {
+    try {
+      const resp = await attempt(proxy.url, proxy.extraHeaders || {}, proxy.passBody);
+      if (resp.ok || resp.status < 500) {
+        _SF_CORS_DOMAINS.add(domain);
+        return resp;
+      }
+    } catch(e) { /* try next */ }
+  }
+
+  // ── 3. All failed — return a synthetic Response so callers don't hard-crash ──
+  return new Response(
+    JSON.stringify({ error: 'All proxies exhausted', url }),
+    { status: 0, headers: { 'Content-Type': 'application/json' } }
+  );
+}
+// END smartFetch ─────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════
 // API CLASSES
 // ═══════════════════════════════════════════════════════════════
 class GitHubAPI {
   constructor(token){ this.token=token; this.base='https://api.github.com'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Accept':'application/vnd.github.v3+json','Content-Type':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error(d.message||'HTTP '+r.status); return d;
   }
   getUser(){ return this.req('GET','/user'); }
@@ -1303,7 +1631,7 @@ class GitLabAPI {
   constructor(token){ this.token=token; this.base='https://gitlab.com/api/v4'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error(d.message||'HTTP '+r.status); return d;
   }
   getUser(){ return this.req('GET','/user'); }
@@ -1324,7 +1652,7 @@ class NetlifyAPI {
   constructor(token){ this.token=token; this.base='https://api.netlify.com/api/v1'; }
   h(extra={}){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json',...extra}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     if(!r.ok){ const t=await r.text(); throw new Error(t||'HTTP '+r.status); } return r.json().catch(()=>({}));
   }
   getUser(){ return this.req('GET','/user'); }
@@ -1337,13 +1665,13 @@ class NetlifyAPI {
     const hashArray=Array.from(new Uint8Array(hashBuffer));
     const sha1=hashArray.map(b=>b.toString(16).padStart(2,'0')).join('');
     // Step 2: Create deploy with file manifest
-    const r1=await fetch(`${this.base}/sites/${siteId}/deploys`,{method:'POST',
+    const r1=await smartFetch(`${this.base}/sites/${siteId}/deploys`,{method:'POST',
       headers:{'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json'},
       body:JSON.stringify({files:{'/index.html':sha1},draft:false})});
     const d1=await r1.json(); if(!r1.ok) throw new Error(d1.message||'Deploy init failed');
     // Step 3: Upload required files
     if(d1.required&&d1.required.length>0){
-      const r2=await fetch(`${this.base}/deploys/${d1.id}/files/index.html`,{method:'PUT',
+      const r2=await smartFetch(`${this.base}/deploys/${d1.id}/files/index.html`,{method:'PUT',
         headers:{'Authorization':`Bearer ${this.token}`,'Content-Type':'application/octet-stream'},
         body:new Blob([htmlContent])});
       if(!r2.ok){ const t=await r2.text(); throw new Error('File upload failed: '+r2.status); }
@@ -1356,7 +1684,7 @@ class VercelAPI {
   constructor(token){ this.token=token; this.base='https://api.vercel.com'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error(d.error&&d.error.message||'HTTP '+r.status); return d;
   }
   getUser(){ return this.req('GET','/v2/user'); }
@@ -1381,7 +1709,7 @@ class NotionAPI {
   constructor(token){ this.token=token; this.base='https://api.notion.com/v1'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json','Notion-Version':'2022-06-28'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error(d.message||'HTTP '+r.status); return d;
   }
   getUser(){ return this.req('GET','/users/me'); }
@@ -1395,7 +1723,7 @@ class MediumAPI {
   constructor(token){ this.token=token; this.base='https://api.medium.com/v1'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json','Accept':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error((d.errors&&d.errors[0]&&d.errors[0].message)||'HTTP '+r.status); return d;
   }
   getUser(){ return this.req('GET','/me'); }
@@ -1405,7 +1733,7 @@ class MediumAPI {
 class HashnodeAPI {
   constructor(token){ this.token=token; this.base='https://gql.hashnode.com'; }
   async query(q,vars={}){
-    const r=await fetch(this.base,{method:'POST',headers:{'Authorization':this.token,'Content-Type':'application/json'},body:JSON.stringify({query:q,variables:vars})});
+    const r=await smartFetch(this.base,{method:'POST',headers:{'Authorization':this.token,'Content-Type':'application/json'},body:JSON.stringify({query:q,variables:vars})});
     const d=await r.json(); if(d.errors) throw new Error(d.errors[0].message); return d.data;
   }
   getUser(){ return this.query('query{me{id username name}}'); }
@@ -1420,7 +1748,7 @@ class RedditAPI {
   constructor(token){ this.token=token; this.base='https://oauth.reddit.com'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'User-Agent':'SEO-Tool/1.0','Content-Type':'application/x-www-form-urlencoded'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?new URLSearchParams(body).toString():undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?new URLSearchParams(body).toString():undefined});
     const d=await r.json(); if(d.error) throw new Error(d.message||d.error); return d;
   }
   getMe(){ return this.req('GET','/api/v1/me'); }
@@ -1431,7 +1759,7 @@ class BloggerAPI {
   constructor(token){ this.token=token; this.base='https://www.googleapis.com/blogger/v3'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error(d.error&&d.error.message||'HTTP '+r.status); return d;
   }
   listBlogs(){ return this.req('GET','/users/self/blogs'); }
@@ -1442,7 +1770,7 @@ class SubstackAPI {
   constructor(token,subdomain){ this.token=token; this.subdomain=subdomain; this.base=`https://${subdomain}.substack.com/api/v1`; }
   h(){ return {'Cookie':`substack.sid=${this.token}`,'Content-Type':'application/json','Origin':'https://'+this.subdomain+'.substack.com','Referer':'https://'+this.subdomain+'.substack.com'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined,credentials:'include'});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined,credentials:'include'});
     const d=await r.json(); if(!r.ok) throw new Error(d.error||d.message||'HTTP '+r.status); return d;
   }
   // Substack v1 API: create draft then publish
@@ -1464,15 +1792,15 @@ class WordPressAPI {
   constructor(token){ this.token=token; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json'}; }
   async getMe(){
-    const r=await fetch('https://public-api.wordpress.com/rest/v1.1/me',{headers:this.h()});
+    const r=await smartFetch('https://public-api.wordpress.com/rest/v1.1/me',{method:'GET',headers:this.h()});
     const d=await r.json(); if(!r.ok) throw new Error(d.error||'HTTP '+r.status); return d;
   }
   async getSites(){
-    const r=await fetch('https://public-api.wordpress.com/rest/v1.1/me/sites',{headers:this.h()});
+    const r=await smartFetch('https://public-api.wordpress.com/rest/v1.1/me/sites',{method:'GET',headers:this.h()});
     const d=await r.json(); if(!r.ok) throw new Error(d.error||'HTTP '+r.status); return d;
   }
   async createPost(siteId,title,content,tags=[]){
-    const r=await fetch(`https://public-api.wordpress.com/rest/v1.1/sites/${siteId}/posts/new`,{method:'POST',headers:this.h(),body:JSON.stringify({title,content,status:'publish',tags:tags.join(','),format:'standard'})});
+    const r=await smartFetch(`https://public-api.wordpress.com/rest/v1.1/sites/${siteId}/posts/new`,{method:'POST',headers:this.h(),body:JSON.stringify({title,content,status:'publish',tags:tags.join(','),format:'standard'})});
     const d=await r.json(); if(!r.ok) throw new Error(d.error||d.message||'HTTP '+r.status); return d;
   }
 }
@@ -1481,7 +1809,7 @@ class DevToAPI {
   constructor(token){ this.token=token; this.base='https://dev.to/api'; }
   h(){ return {'api-key':this.token,'Content-Type':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error(d.error||'HTTP '+r.status); return d;
   }
   getUser(){ return this.req('GET','/users/me'); }
@@ -1492,7 +1820,7 @@ class TumblrAPI {
   constructor(token,blogName){ this.token=token; this.blogName=blogName; this.base='https://api.tumblr.com/v2'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(d.meta&&d.meta.status>=400) throw new Error(d.meta.msg||'HTTP '+d.meta.status); return d;
   }
   getUser(){ return this.req('GET','/user/info'); }
@@ -1519,7 +1847,7 @@ class GhostAPI {
   }
   async h(){ const jwt=await this._jwt(); return {'Authorization':`Ghost ${jwt}`,'Content-Type':'application/json','Accept-Version':'v5.0'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:await this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:await this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error((d.errors&&d.errors[0]&&d.errors[0].message)||'HTTP '+r.status); return d;
   }
   getSite(){ return this.req('GET','/site/'); }
@@ -1531,7 +1859,7 @@ class TelegraphAPI {
   async req(method,params={}){
     const url=new URL(this.base+'/'+method);
     Object.entries({...params,access_token:this.token}).forEach(([k,v])=>url.searchParams.set(k,String(v)));
-    const r=await fetch(url.toString()); const d=await r.json();
+    const r=await smartFetch(url.toString(),{method:'GET'}); const d=await r.json();
     if(!d.ok) throw new Error(d.error||'Telegraph error'); return d.result;
   }
   getAccount(){ return this.req('getAccountInfo',{fields:JSON.stringify(['short_name','page_count'])}); }
@@ -1554,7 +1882,7 @@ class TelegraphAPI {
     const linkLines=(markdownContent||'').match(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g)||[];
     if(linkLines.length){ nodes.push({tag:'p',children:['Resources: ',...linkLines.map(m=>{ const [,label,href]=m.match(/\[([^\]]+)\]\(([^)]+)\)/)||[]; return {tag:'a',attrs:{href,target:'_blank'},children:[label||href]}; }).flatMap((n,i,a)=>i<a.length-1?[n,', ']:[n])]}); }
     const safeNodes=nodes.slice(0,200);
-    const r=await fetch(this.base+'/createPage',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await smartFetch(this.base+'/createPage',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({access_token:this.token,title:title.slice(0,256),author_name:(authorName||'').slice(0,128),content:safeNodes,return_content:false})});
     const d=await r.json(); if(!d.ok) throw new Error(d.error||'Telegraph createPage failed'); return d.result;
   }
@@ -1564,7 +1892,7 @@ class CloudflareAPI {
   constructor(token,accountId){ this.token=token; this.accountId=accountId; this.base='https://api.cloudflare.com/client/v4'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!d.success) throw new Error((d.errors&&d.errors[0]&&d.errors[0].message)||'CF error'); return d.result;
   }
   getUser(){ return this.req('GET','/user'); }
@@ -1572,7 +1900,7 @@ class CloudflareAPI {
   async uploadPages(projectName,htmlContent){
     const formData=new FormData();
     formData.append('/index.html',new Blob([htmlContent],{type:'text/html'}),'/index.html');
-    const r=await fetch(`${this.base}/accounts/${this.accountId}/pages/projects/${projectName}/deployments`,{method:'POST',headers:{'Authorization':`Bearer ${this.token}`},body:formData});
+    const r=await smartFetch(`${this.base}/accounts/${this.accountId}/pages/projects/${projectName}/deployments`,{method:'POST',headers:{'Authorization':`Bearer ${this.token}`},body:formData});
     const d=await r.json(); if(!d.success) throw new Error((d.errors&&d.errors[0]&&d.errors[0].message)||'CF deploy error'); return d.result;
   }
 }
@@ -1581,7 +1909,7 @@ class WixAPI {
   constructor(token,siteId){ this.token=token; this.siteId=siteId; this.base='https://www.wixapis.com'; }
   h(){ return {'Authorization':this.token,'wix-site-id':this.siteId,'Content-Type':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error(d.message||'HTTP '+r.status); return d;
   }
   async createPost(title,htmlContent,tags=[]){
@@ -1609,7 +1937,7 @@ class ReplitAPI {
   constructor(token){ this.token=token; this.base='https://replit.com/graphql'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'}; }
   async query(q,vars={}){
-    const r=await fetch(this.base,{method:'POST',headers:this.h(),body:JSON.stringify({query:q,variables:vars})});
+    const r=await smartFetch(this.base,{method:'POST',headers:this.h(),body:JSON.stringify({query:q,variables:vars})});
     const d=await r.json(); if(d.errors) throw new Error(d.errors[0].message); return d.data;
   }
   getUser(){ return this.query('query{currentUser{id username}}'); }
@@ -1620,7 +1948,7 @@ class IssuuAPI {
   constructor(token){ this.token=token; this.base='https://api.issuu.com/v2'; }
   h(){ return {'Authorization':`Bearer ${this.token}`,'Content-Type':'application/json'}; }
   async req(method,path,body){
-    const r=await fetch(this.base+path,{method,headers:this.h(),body:body?JSON.stringify(body):undefined});
+    const r=await smartFetch(this.base+path,{method:method,headers:this.h(),body:body?JSON.stringify(body):undefined});
     const d=await r.json(); if(!r.ok) throw new Error(d.message||'HTTP '+r.status); return d;
   }
   getUser(){ return this.req('GET','/drafts?size=1'); }
@@ -2181,13 +2509,11 @@ async function lmVerify(id){
   const hdrs=lmAuthHeaders(s);
   let ok=false, code=0, ms=0;
   const t0=Date.now();
-  for(const url of [fullUrl, 'https://corsproxy.io/?'+encodeURIComponent(fullUrl)]){
-    try{
-      const r=await fetch(url,{headers:hdrs,signal:AbortSignal.timeout(10000)});
-      code=r.status; ms=Date.now()-t0;
-      ok=r.ok; break;
-    }catch(e){ if(url===fullUrl) continue; }
-  }
+  try{
+    const r=await smartFetch(fullUrl,{method:'GET',headers:hdrs,sfTimeout:10000});
+    code=r.status; ms=Date.now()-t0;
+    ok=r.ok;
+  }catch(e){ ok=false; }
   s.status=ok?'active':code===401||code===403?'auth_failed':code>0?'error':'unreachable';
   s.verified=new Date().toLocaleTimeString(); s.code=code; s.ms=ms;
   lmSave(); lmRenderRow(id);
@@ -2388,7 +2714,7 @@ const LM_POST_BUILDERS = {
   medium: async(s,content,hdrs)=>{
     // First get user ID
     let userId='me';
-    try{ const r=await fetch('https://api.medium.com/v1/me',{headers:hdrs,signal:AbortSignal.timeout(8000)}); const d=await r.json(); userId=d?.data?.id||'me'; }catch(e){}
+    try{ const r=await smartFetch('https://api.medium.com/v1/me',{method:'GET',headers:hdrs,sfTimeout:8000}); const d=await r.json(); userId=d?.data?.id||'me'; }catch(e){}
     return await lmApiPost(`https://api.medium.com/v1/users/${userId}/posts`,{title:content.title,contentFormat:'html',content:content.html,tags:content.tags?.slice(0,5)||[],publishStatus:'public'},hdrs);
   },
 
@@ -2496,7 +2822,7 @@ const LM_UNIVERSAL_STRATEGIES = [
       for(const ep of endpoints){
         for(const body of bodies){
           try{
-            const r=await fetch(ep,{method:'POST',headers:hdrs,body:JSON.stringify(body),signal:AbortSignal.timeout(8000)});
+            const r=await smartFetch(ep,{method:'POST',headers:hdrs,body:JSON.stringify(body),sfTimeout:8000});
             if(r.ok||r.status===201){
               const d=await r.json().catch(()=>({}));
               return {ok:true,url:d.url||d.link||d.permalink||d.html_url||d.public_url||ep,strategy:'REST JSON POST',endpoint:ep};
@@ -2520,7 +2846,7 @@ const LM_UNIVERSAL_STRATEGIES = [
       form.append('post_type','post'); form.append('publish','Publish');
       const h={...hdrs}; delete h['Content-Type'];
       try{
-        const r=await fetch(ep,{method:'POST',headers:h,body:form,signal:AbortSignal.timeout(12000)});
+        const r=await smartFetch(ep,{method:'POST',headers:h,body:form,sfTimeout:12000});
         if(r.ok||r.status===201||r.status===302) return {ok:true,url:r.url||ep,strategy:'Form POST',endpoint:ep};
       }catch(e){}
       return {ok:false};
@@ -2546,7 +2872,7 @@ const LM_UNIVERSAL_STRATEGIES = [
         </struct></value></param>
       </params></methodCall>`;
       try{
-        const r=await fetch(ep,{method:'POST',headers:{'Content-Type':'text/xml'},body:xml,signal:AbortSignal.timeout(12000)});
+        const r=await smartFetch(ep,{method:'POST',headers:{'Content-Type':'text/xml'},body:xml,sfTimeout:12000});
         const text=await r.text();
         const ok=text.includes('<methodResponse>')&&!text.includes('<fault>');
         const idM=text.match(/<int>(\d+)<\/int>/); const postId=idM?idM[1]:'';
@@ -2569,7 +2895,7 @@ const LM_UNIVERSAL_STRATEGIES = [
       ];
       for(const query of mutations){
         try{
-          const r=await fetch(ep,{method:'POST',headers:hdrs,body:JSON.stringify({query}),signal:AbortSignal.timeout(10000)});
+          const r=await smartFetch(ep,{method:'POST',headers:hdrs,body:JSON.stringify({query}),sfTimeout:10000});
           const d=await r.json().catch(()=>({}));
           if(d.data&&!d.errors){
             const url=Object.values(d.data||{})[0]?.url||'';
@@ -2596,7 +2922,7 @@ const LM_UNIVERSAL_STRATEGIES = [
       ];
       for(const body of payloads){
         try{
-          const r=await fetch(ep,{method:'POST',headers:cookieHdrs,body:JSON.stringify(body),signal:AbortSignal.timeout(12000),credentials:'include'});
+          const r=await smartFetch(ep,{method:'POST',headers:cookieHdrs,body:JSON.stringify(body),sfTimeout:12000,credentials:'include'});
           if(r.ok||r.status===201){const d=await r.json().catch(()=>({}));return{ok:true,url:d.url||d.canonical_url||ep,strategy:'Cookie POST',endpoint:ep};}
         }catch(e){}
       }
@@ -2615,7 +2941,7 @@ const LM_UNIVERSAL_STRATEGIES = [
       const base=s.siteUrl.replace(/\/$/,'');
       const ep=cfg.customEndpoint||`${base}/api/v1/posts`;
       try{
-        const r=await fetch(ep,{method:'POST',headers:bHdrs,body:JSON.stringify({title:content.title,content:content.html,status:'publish'}),signal:AbortSignal.timeout(12000)});
+        const r=await smartFetch(ep,{method:'POST',headers:bHdrs,body:JSON.stringify({title:content.title,content:content.html,status:'publish'}),sfTimeout:12000});
         if(r.ok||r.status===201){const d=await r.json().catch(()=>({}));return{ok:true,url:d.url||d.permalink||ep,strategy:'Basic Auth REST',endpoint:ep};}
       }catch(e){}
       return {ok:false};
@@ -2651,17 +2977,15 @@ const LM_UNIVERSAL_STRATEGIES = [
 // ─── CORE API POST HELPER ────────────────────────────────────
 async function lmApiPost(ep, payload, hdrs, extractKey='', gqlBody=null){
   const body=gqlBody?JSON.stringify(gqlBody):JSON.stringify(payload);
-  for(const url of [ep,'https://corsproxy.io/?'+encodeURIComponent(ep)]){
-    try{
-      const r=await fetch(url,{method:'POST',headers:hdrs,body,signal:AbortSignal.timeout(15000)});
-      if(r.ok||r.status===201){
-        const d=await r.json().catch(()=>({}));
-        const data=extractKey?d[extractKey]?.[0]??d:d;
-        return {ok:true,url:data?.url||data?.link||data?.permalink||data?.html_url||data?.public_url||data?.canonical_url||ep,raw:d};
-      }
-      if(r.status===401||r.status===403) return {ok:false,code:r.status,msg:'Auth failed — check credentials'};
-    }catch(e){ continue; }
-  }
+  try{
+    const r=await smartFetch(ep,{method:'POST',headers:hdrs,body,sfTimeout:15000});
+    if(r.ok||r.status===201){
+      const d=await r.json().catch(()=>({}));
+      const data=extractKey?d[extractKey]?.[0]??d:d;
+      return {ok:true,url:data?.url||data?.link||data?.permalink||data?.html_url||data?.public_url||data?.canonical_url||ep,raw:d};
+    }
+    if(r.status===401||r.status===403) return {ok:false,code:r.status,msg:'Auth failed — check credentials'};
+  }catch(e){ /* fall through */ }
   return {ok:false,msg:'All endpoints failed'};
 }
 
@@ -2882,12 +3206,8 @@ async function lmpbTestAuth(id){
   let ep=p.verifyEp||'/'; ep=ep.replace('{blogId}',s.blogId||'').replace(/{.*?}/g,'');
   const fullUrl=ep.startsWith('http')?ep:base+ep;
   try{
-    const r=await fetch(fullUrl,{headers:hdrs,signal:AbortSignal.timeout(10000)});
+    const r=await smartFetch(fullUrl,{method:'GET',headers:hdrs,sfTimeout:10000});
     lmpbLog(`  ${r.ok?'✔':'✗'} Auth test: HTTP ${r.status} ${r.ok?'— Connected OK':'— Check credentials'}`,r.ok?'t-info':'t-warn');
-    if(!r.ok&&fullUrl!==`https://corsproxy.io/?${encodeURIComponent(fullUrl)}`){
-      const r2=await fetch('https://corsproxy.io/?'+encodeURIComponent(fullUrl),{headers:hdrs,signal:AbortSignal.timeout(10000)});
-      lmpbLog(`  CORS proxy: HTTP ${r2.status} ${r2.ok?'— OK':'— Failed'}`,r2.ok?'t-info':'t-warn');
-    }
   }catch(e){ lmpbLog(`  ✗ Connection error: ${e.message}`,'t-warn'); }
 }
 
@@ -3621,17 +3941,17 @@ const PLATFORM_META = {
   vercel:    {type:'file',    label:'Project Prefix',   ph:'seo',                      hint:'Deploys a static index.html to a new Vercel project with a vercel.app subdomain.',                        defVal:'seo'},
   cloudflare:{type:'file',    label:'Project Prefix',   ph:'seo',                      hint:'Creates a Cloudflare Pages project and uploads index.html. Goes live at project.pages.dev.',              defVal:'seo'},
   github_pages_existing:{type:'file'},
-  medium:    {type:'article', label:'Article Tags',     ph:'seo,guide,marketing',      hint:'Publishes a formatted Markdown article to your Medium account. Max 5 tags.',                             defVal:'seo,guide'},
-  substack:  {type:'article', label:'Subdomain',        ph:'yourpublication',          hint:'Publishes a newsletter post to your Substack. Requires your Substack subdomain (yourname.substack.com).', defVal:''},
-  wordpress: {type:'article', label:'Post Tags',        ph:'seo,guide',                hint:'Creates and publishes a post to your WordPress.com site via the REST API.',                               defVal:'seo,guide'},
-  blogger:   {type:'article', label:'Blog ID',          ph:'1234567890123456789',      hint:'Publish a post to your Blogger/Blogspot blog. Find your Blog ID in Blogger Settings.',                   defVal:''},
-  devto:     {type:'article', label:'Tags (max 4)',     ph:'webdev,seo,javascript',    hint:'Publishes a developer article to dev.to. Tags must be lowercase, no spaces, max 4.',                     defVal:'webdev,seo'},
-  hashnode:  {type:'article', label:'Publication ID',   ph:'64a6b...',                 hint:'Publishes to your Hashnode blog. Get the Publication ID from your Hashnode dashboard Settings.',         defVal:''},
+  medium:    {type:'cms',     label:'Article Tags',     ph:'seo,guide,marketing',      hint:'Publishes a formatted Markdown article to your Medium account. Max 5 tags.',                             defVal:'seo,guide'},
+  substack:  {type:'cms',     label:'Subdomain',        ph:'yourpublication',          hint:'Publishes a newsletter post to your Substack. Requires your Substack subdomain (yourname.substack.com).', defVal:''},
+  wordpress: {type:'cms',     label:'Post Tags',        ph:'seo,guide',                hint:'Creates and publishes a post to your WordPress.com site via the REST API.',                               defVal:'seo,guide'},
+  blogger:   {type:'cms',     label:'Blog ID',          ph:'1234567890123456789',      hint:'Publish a post to your Blogger/Blogspot blog. Find your Blog ID in Blogger Settings.',                   defVal:''},
+  devto:     {type:'cms',     label:'Tags (max 4)',     ph:'webdev,seo,javascript',    hint:'Publishes a developer article to dev.to. Tags must be lowercase, no spaces, max 4.',                     defVal:'webdev,seo'},
+  hashnode:  {type:'cms',     label:'Publication ID',   ph:'64a6b...',                 hint:'Publishes to your Hashnode blog. Get the Publication ID from your Hashnode dashboard Settings.',         defVal:''},
   reddit:    {type:'post',    label:'Subreddit',        ph:'entrepreneur',             hint:'Submits a text post to the specified subreddit. Account needs karma to avoid spam filters.',              defVal:'entrepreneur'},
-  tumblr:    {type:'post',    label:'Blog Identifier',  ph:'yourblog.tumblr.com',      hint:'Posts to your Tumblr blog. Use your blog URL or just the name (yourblog).',                             defVal:''},
-  ghost:     {type:'article', label:'Ghost Blog URL',   ph:'https://yourblog.ghost.io',hint:'Publishes to your self-hosted Ghost CMS. Requires the Ghost Admin API key (id:secret format).',         defVal:''},
+  tumblr:    {type:'cms',     label:'Blog Identifier',  ph:'yourblog.tumblr.com',      hint:'Posts to your Tumblr blog. Use your blog URL or just the name (yourblog).',                             defVal:''},
+  ghost:     {type:'cms',     label:'Ghost Blog URL',   ph:'https://yourblog.ghost.io',hint:'Publishes to your self-hosted Ghost CMS. Requires the Ghost Admin API key (id:secret format).',         defVal:''},
   notion:    {type:'page',    label:'Parent Page ID',   ph:'abc123... (32 char hex)',  hint:'Creates a Notion page inside the specified parent page. Get the ID from the page URL.',                  defVal:''},
-  wix:       {type:'article', label:'Site ID',          ph:'your-wix-site-id',         hint:'Publishes a blog post to your Wix site via the Wix Blog v3 API.',                                      defVal:''},
+  wix:       {type:'cms',     label:'Site ID',          ph:'your-wix-site-id',         hint:'Publishes a blog post to your Wix site via the Wix Blog v3 API.',                                      defVal:''},
   telegraph: {type:'page',    label:'Author Name',      ph:'Your Name',                hint:'Creates an instant anonymous page on Telegra.ph. No further setup needed — goes live instantly.',       defVal:''},
   codepen:   {type:'prefill', label:'CodePen Username', ph:'yourusername',             hint:'Generates a CodePen prefill URL. Click the link to open the editor with content pre-loaded, then Save.', defVal:''},
   replit:    {type:'file',    label:'Repl Prefix',      ph:'seo',                      hint:'Creates a new public HTML Repl on your Replit account.',                                                 defVal:'seo'},
@@ -3641,17 +3961,17 @@ const PLATFORM_META = {
   caribbeanfever:{type:'post',   label:'Password',         ph:'your-password',            hint:'Creates a photo album post on CaribbeanFever. Requires username + password.',     defVal:''},
   bitbin:       {type:'page',    label:'Label',            ph:'seo-paste',                hint:'Creates an anonymous public paste on Bitbin.it. No account needed.',              defVal:'seo-paste'},
   pastelink:    {type:'page',    label:'Label',            ph:'seo-paste',                hint:'Creates an anonymous public paste on Pastelink.net. No account needed.',          defVal:'seo-paste'},
-  click4r:      {type:'article', label:'Password',         ph:'your-password',            hint:'Publishes a blog post on Click4R. Requires your username + password.',            defVal:''},
+  click4r:      {type:'cms',     label:'Password',         ph:'your-password',            hint:'Publishes a blog post on Click4R. Requires your username + password.',            defVal:''},
   ideone:       {type:'page',    label:'Label',            ph:'seo-snippet',              hint:'Creates a public text paste on Ideone.com. No account needed.',                   defVal:'seo-snippet'},
   controlc:     {type:'page',    label:'Label',            ph:'seo-paste',                hint:'Creates an anonymous paste on ControlC.com. No account needed.',                  defVal:'seo-paste'},
   rentry:       {type:'page',    label:'Edit Code',        ph:'leave blank for random',   hint:'Creates a Markdown page on Rentry.co. Edit code is optional.',                    defVal:''},
-  techplanet:   {type:'article', label:'Password',         ph:'your-password',            hint:'Publishes a post on TechPlanet.today. Requires username + password.',             defVal:''},
-  vingle:       {type:'article', label:'Interest ID',      ph:'interest-id',              hint:'Publishes a card to Vingle via access token. Get interest ID from your profile.', defVal:''},
+  techplanet:   {type:'cms',     label:'Password',         ph:'your-password',            hint:'Publishes a post on TechPlanet.today. Requires username + password.',             defVal:''},
+  vingle:       {type:'cms',     label:'Interest ID',      ph:'interest-id',              hint:'Publishes a card to Vingle via access token. Get interest ID from your profile.', defVal:''},
   writeonwall:  {type:'post',    label:'Password',         ph:'your-password',            hint:'Submits a question post on WriteOnWall. Requires username + password.',           defVal:''},
   taylorhicks:  {type:'post',    label:'Password',         ph:'your-password',            hint:'Posts to TaylorHicks Ning forum. Requires Ning API key + password.',              defVal:''},
   snaplant:     {type:'post',    label:'Password',         ph:'your-password',            hint:'Submits a question on Snaplant Q&A. Requires username + password.',               defVal:''},
-  theprose:     {type:'article', label:'Password',         ph:'your-password',            hint:'Publishes a post on TheProse. Requires username + session token/password.',       defVal:''},
-  deviantart:   {type:'article', label:'Username',         ph:'your-username',            hint:'Publishes a journal entry to DeviantArt via OAuth2 access token.',                defVal:''},
+  theprose:     {type:'cms',     label:'Password',         ph:'your-password',            hint:'Publishes a post on TheProse. Requires username + session token/password.',       defVal:''},
+  deviantart:   {type:'cms',     label:'Username',         ph:'your-username',            hint:'Publishes a journal entry to DeviantArt via OAuth2 access token.',                defVal:''},
   // ── PASTE SITES ──
   pastebin:     {type:'page',    label:'Pastebin API Key', ph:'your-api-key',             hint:'Get a free API key at pastebin.com/doc_api — required for paste creation.',       defVal:''},
   dpaste:       {type:'page',    label:'Label',            ph:'seo-paste',                hint:'Creates an anonymous public paste on dpaste.org. No account needed.',             defVal:'seo-paste'},
@@ -3730,7 +4050,13 @@ function renderCampaign(el){
       <input type="number" id="camp-delay" value="5" min="1" max="300" style="max-width:120px"/></div>`:''}
     ${pid==='devto'?`<div class="fg mt8"><label class="lbl">Tags (lowercase, no spaces, max 4 — comma separated)</label><input type="text" id="camp-tags" value="webdev,seo,javascript,tutorial" placeholder="webdev,seo,javascript"/></div>`:''}
     ${pid==='cloudflare'?`<div class="fg mt8"><label class="lbl">Cloudflare Account ID (from dashboard URL)</label><input type="text" id="camp-cfacct" placeholder="your-cloudflare-account-id" value="${accs[0]&&accs[0].extra||''}"/></div>`:''}
-    <div class="flex aic g8 mt8">
+  </div>
+
+  ${renderContentFields(pid,'camp')}
+
+  <div class="card">
+    <div class="card-title">Run Campaign</div>
+    <div class="flex aic g8 mt0">
       <button class="btn btn-primary" id="camp-run-btn" onclick="runCampaign('${pid}')">▶ Run Campaign — ${S.keywords.length} keyword(s)</button>
       <div class="prog-wrap f1" style="margin:0;display:none" id="camp-prog-wrap"><div class="prog-fill" id="camp-prog"></div></div>
     </div>
@@ -3742,8 +4068,10 @@ function renderCampaign(el){
   </div>`;
 }
 
+
 async function runCampaign(pid){
   if(!S.keywords.length){ toast('Add keywords first in the Keywords page.','w'); return; }
+  syncContentFields('camp'); // sync all content fields from DOM before run
   const btn=document.getElementById('camp-run-btn');
   const termEl=document.getElementById('camp-term');
   const progWrap=document.getElementById('camp-prog-wrap');
@@ -3791,9 +4119,24 @@ async function runCampaign(pid){
   updateHeader(); updatePlatformBar();
 }
 
+// Wrapper around bcProxyFetch that logs which proxy was used to terminal
+// Use this for all paste/anonymous site requests instead of raw fetch()
+async function pasteProxyFetch(url, opts, term){
+  const r = await bcProxyFetch(url, opts);
+  if(term && r.proxy) term.add('    [proxy: '+r.proxy+']','info');
+  if(!r.ok && r.error==='All proxies exhausted'){
+    throw new Error('All CORS proxies failed for '+new URL(url).hostname+' — site may block proxies. Try again or add a custom proxy in Blog Commenter settings.');
+  }
+  return r;
+}
+
 async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   const p=getPlatform(pid);
   const sl=slug((extraVal||'seo')+'-'+kw);
+  // Resolve all content fields once for this keyword
+  const _ec=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,p.domain);
+  const _tags=_ec.tags.split(',').map(t=>t.trim().toLowerCase()).filter(Boolean);
+  const _category=_ec.category||'General';
   term.add(`[${idx+1}/${S.keywords.length}] ${p.icon} ${p.name}: "${kw}"`, 'info');
 
   // ── FILE-BASED PLATFORMS (subdomain + index.html) ──────────────
@@ -3803,14 +4146,14 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     const api=new GitHubAPI(account.token);
     const repoName=slug((extraVal||'seo')+'-'+kw).slice(0,100)||'seo-page';
     const pageUrl='https://'+account.login+'.github.io/'+repoName+'/';
-    try{ await api.createRepo(repoName,kw+' — Guide '+year()); await sleep(1500); }
+    try{ await api.createRepo(repoName,getEffectiveContent(kw,S.links,idx,S.keywords,'','').title); await sleep(1500); }
     catch(e){
       if(e.message.includes('already exists')||e.message.includes('422')||e.message.includes('name already exists')){
         term.add('  Repo exists — updating content','warn');
       } else throw e;
     }
     await sleep(1000);
-    const readme=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'github.io');
+    const readme=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'github.io').body;
     const html=generateHtmlPage(kw,account.login,repoName,S.links,'github');
     const sitemap=`<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${pageUrl}</loc><lastmod>${new Date().toISOString().split('T')[0]}</lastmod><priority>1.0</priority></url></urlset>`;
     const existRM=await api.getFile(account.login,repoName,'README.md');
@@ -3834,14 +4177,14 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     const projSlug=slug((extraVal||'seo')+'-'+kw).slice(0,100)||'seo-page';
     const pageUrl='https://'+account.login+'.gitlab.io/'+projSlug+'/';
     let proj;
-    try{ proj=await api.createProject(projSlug,kw+' Guide '+year()); await sleep(1500); }
+    try{ proj=await api.createProject(projSlug,getEffectiveContent(kw,S.links,idx,S.keywords,'','').title); await sleep(1500); }
     catch(e){
       if(e.message&&(e.message.includes('already been taken')||e.message.includes('already exists'))){
         term.add('  Project exists — updating content','warn');
         proj={id:null,name:projSlug}; // will fail on file ops but user can handle
       } else throw e;
     }
-    const readme=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'gitlab.io');
+    const readme=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'gitlab.io').body;
     const html=generateHtmlPage(kw,account.login,projSlug,S.links,'gitlab');
     // CI pipeline: copy index.html into /public, enable Pages artifact
     const ci=`image: alpine\npages:\n  stage: deploy\n  script:\n    - mkdir -p public\n    - cp index.html public/index.html\n  artifacts:\n    paths:\n      - public\n  rules:\n    - if: $CI_COMMIT_BRANCH == "main"\n`;
@@ -3917,10 +4260,10 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     term.add('  Getting Medium user ID...','info');
     const u=await api.getUser();
     const userId=u.data&&u.data.id; if(!userId) throw new Error('Could not get Medium user ID — check your Integration Token');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'medium.com');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'medium.com').body;
     const tags=(extraVal||'seo,guide').split(',').map(t=>t.trim()).filter(Boolean).slice(0,5);
     term.add('  Publishing article...','info');
-    const res=await api.createPost(userId,kw+': Complete Guide '+year(),content,tags);
+    const res=await api.createPost(userId,getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,content,tags);
     return (res.data&&res.data.url)||'https://medium.com/@'+account.login;
   }
 
@@ -3931,7 +4274,7 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     const api=new SubstackAPI(account.token,subdomain);
     const html=generateHtmlPage(kw,account.login,sl,S.links,'substack');
     term.add('  Publishing to Substack ('+subdomain+'.substack.com)...','info');
-    const res=await api.createPost(kw+': Complete Guide '+year(),html);
+    const res=await api.createPost(getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,html);
     return res.url||res.canonical_url||'https://'+subdomain+'.substack.com';
   }
 
@@ -3945,7 +4288,7 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     const html=generateHtmlPage(kw,account.login,sl,S.links,'wordpress');
     const tags=(extraVal||'seo,guide').split(',').map(t=>t.trim()).filter(Boolean);
     term.add('  Publishing post...','info');
-    const res=await api.createPost(siteId,kw+': Complete Guide '+year(),html,tags);
+    const res=await api.createPost(siteId,getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,html,tags);
     return res.URL||res.link||'https://wordpress.com';
   }
 
@@ -3956,18 +4299,17 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     if(!blogId) throw new Error('Blogger Blog ID is required — find it in Blogger Settings → Blog ID');
     const html=generateHtmlPage(kw,account.login,sl,S.links,'blogger');
     term.add('  Publishing to Blogger...','info');
-    const res=await api.createPost(blogId,kw+': Complete Guide '+year(),html,[kw,'seo','guide']);
+    const res=await api.createPost(blogId,getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,html,_tags.slice(0,5));
     return res.url||'https://blogger.com';
   }
 
   if(pid==='devto'){
     // Dev.to: publish a Markdown article via API key
     const api=new DevToAPI(account.token);
-    const tagsStr=(document.getElementById('camp-tags')||{value:'webdev,seo,javascript,tutorial'}).value;
-    const tags=tagsStr.split(',').map(t=>t.trim().replace(/\s+/g,'').toLowerCase()).filter(Boolean).slice(0,4);
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'dev.to');
+    const tags=_tags.slice(0,4);
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'dev.to').body;
     term.add('  Publishing article to Dev.to...','info');
-    const art=await api.createArticle(kw+': Complete Guide '+year(),content,tags);
+    const art=await api.createArticle(getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,content,tags);
     return art.url||'https://dev.to/'+account.login;
   }
 
@@ -3981,9 +4323,9 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
                 : '';
     if(!pubId) throw new Error('Hashnode Publication ID is required and must be a valid 24-character ObjectId — find it in your Hashnode Dashboard → Publication Settings → General');
     const api=new HashnodeAPI(account.token);
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'hashnode.dev');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'hashnode.dev').body;
     term.add('  Publishing to Hashnode...','info');
-    const res=await api.createPost(pubId,kw+': Complete Guide '+year(),content,[kw,'seo','guide']);
+    const res=await api.createPost(pubId,getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,content,_tags.slice(0,5));
     return (res&&res.publishPost&&res.publishPost.post&&res.publishPost.post.url)||'https://hashnode.com/@'+account.login;
   }
 
@@ -3994,7 +4336,7 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     const api=new GhostAPI(account.token,apiUrl);
     const html=generateHtmlPage(kw,account.login,sl,S.links,'ghost');
     term.add('  Publishing to Ghost ('+apiUrl+')...','info');
-    const res=await api.createPost(kw+': Complete Guide '+year(),html,[kw,'seo','guide']);
+    const res=await api.createPost(getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,html,_tags.slice(0,5));
     return (res.posts&&res.posts[0]&&res.posts[0].url)||apiUrl;
   }
 
@@ -4005,7 +4347,7 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     const api=new WixAPI(account.token,siteId);
     const htmlContent=generateHtmlPage(kw,account.login,sl,S.links,'wix');
     term.add('  Publishing blog post to Wix...','info');
-    const res=await api.createPost(kw+': Complete Guide '+year(),htmlContent,[kw,'seo']);
+    const res=await api.createPost(getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,htmlContent,_tags.slice(0,5));
     return (res.post&&res.post.url)||'https://'+account.login+'.wixsite.com';
   }
 
@@ -4013,9 +4355,9 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     // Tumblr: create a post using OAuth Bearer Token + blog identifier
     const blogId=(extraVal||account.extra||account.login+'.tumblr.com').replace('https://','');
     const api=new TumblrAPI(account.token,blogId);
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'tumblr.com');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'tumblr.com').body;
     term.add('  Posting to Tumblr blog: '+blogId,'info');
-    const post=await api.createPost(blogId,kw,content,[kw,'seo','guide']);
+    const post=await api.createPost(blogId,kw,content,_tags.slice(0,5));
     const postId=post.response&&post.response.id||post.id;
     return 'https://'+blogId+'/post/'+(postId||'');
   }
@@ -4025,10 +4367,10 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   if(pid==='reddit'){
     // Reddit: submit a self (text) post to the specified subreddit
     const api=new RedditAPI(account.token);
-    const subreddit=(extraVal||account.extra||'entrepreneur').replace(/^r\//,'');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'reddit.com');
+    const subreddit=(extraVal||account.extra||_category||'entrepreneur').replace(/^r\//,'');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'reddit.com').body;
     term.add('  Submitting to r/'+subreddit+'...','info');
-    const res=await api.submit(subreddit,kw+': Complete Guide '+year(),content);
+    const res=await api.submit(subreddit,getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,content);
     const postUrl=res.json&&res.json.data&&res.json.data.url;
     return postUrl||'https://reddit.com/r/'+subreddit;
   }
@@ -4040,19 +4382,19 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     const parentId=(extraVal||account.extra||'').replace(/-/g,'');
     if(!parentId) throw new Error('Notion Parent Page ID is required — get it from the page URL (32-char hex string)');
     const api=new NotionAPI(account.token);
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'notion.site');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'notion.site').body;
     term.add('  Creating Notion page...','info');
-    const page=await api.createPage(parentId,kw+': Complete Guide '+year(),content);
+    const page=await api.createPage(parentId,getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,content);
     return page.url||'https://notion.so/'+account.login;
   }
 
   if(pid==='telegraph'){
     // Telegraph: create an instant page (no account required beyond access token)
     const api=new TelegraphAPI(account.token);
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'telegra.ph');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'telegra.ph').body;
     const authorName=extraVal||account.login||'';
     term.add('  Creating Telegra.ph page...','info');
-    const page=await api.createPage(kw+': Complete Guide '+year(),content,authorName);
+    const page=await api.createPage(getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,content,authorName);
     return 'https://telegra.ph/'+page.path;
   }
 
@@ -4062,7 +4404,7 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     // CodePen: generate a prefill URL — no API, user must click and save
     const html=generateHtmlPage(kw,account.login,sl,S.links,'codepen');
     const css=`body{font-family:system-ui,sans-serif;max-width:900px;margin:0 auto;padding:24px;background:#f8fafc;color:#1e293b}h1,h2,h3{color:#1e1b4b}a{color:#4f46e5}section{background:white;padding:20px;margin:16px 0;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.1)}`;
-    const data=JSON.stringify({title:kw+' Guide '+year(),html,css,tags:['seo','guide'],editors:'110'});
+    const data=JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,html,css,tags:_tags.slice(0,5),editors:'110'});
     const penUrl='https://codepen.io/pen/define?data='+encodeURIComponent(data);
     term.add('  ℹ CodePen prefill URL generated — click to open editor and save','warn');
     return penUrl;
@@ -4072,230 +4414,208 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
 
   if(pid==='issuu'){
     const api=new IssuuAPI(account.token);
-    const desc=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'issuu.com').slice(0,500);
+    const desc=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'issuu.com').body.slice(0,500);
     term.add('  Creating Issuu draft...','info');
-    const draft=await api.createDraft(kw+': Complete Guide '+year(),desc);
+    const draft=await api.createDraft(getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,desc);
     return draft.publicUrl||draft.link||'https://issuu.com/'+account.login;
   }
 
   // ── PASTE / NO-LOGIN PLATFORMS ─────────────────────────────────
 
   if(pid==='bitbin'){
-    // Bitbin.it — POST to /api with content, returns slug
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','bitbin.it');
-    const r=await fetch('https://bitbin.it/api/',{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:new URLSearchParams({content,language:'text',expire:'never'}).toString()});
-    const d=await r.json();
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','bitbin.it').body;
+    const r=await pasteProxyFetch('https://bitbin.it/api/',{method:'POST',
+      contentType:'application/x-www-form-urlencoded',
+      body:new URLSearchParams({content,language:'text',expire:'never'}, term).toString()});
+    if(!r.ok&&!r.text) throw new Error('Bitbin: '+r.error);
+    let d={}; try{d=JSON.parse(r.text);}catch(e){}
     const path=d.data&&(d.data.hash||d.data.id||d.data.slug);
-    if(!path) throw new Error('Bitbin: no path returned — '+JSON.stringify(d).slice(0,100));
+    if(!path) throw new Error('Bitbin: no path returned — '+r.text.slice(0,100));
     return 'https://bitbin.it/'+path+'/';
   }
 
   if(pid==='pastelink'){
-    // Pastelink.net — POST form to create anonymous paste
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','pastelink.net');
-    const r=await fetch('https://pastelink.net/api/paste',{method:'POST',
-      headers:{'Content-Type':'application/json','Accept':'application/json'},
-      body:JSON.stringify({content,title:kw+' Guide '+year()})});
-    const d=await r.json();
-    const pasteId=d.paste_key||d.id||d.link;
-    if(!pasteId) throw new Error('Pastelink: '+JSON.stringify(d).slice(0,100));
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','pastelink.net').body;
+    const r=await pasteProxyFetch('https://pastelink.net/api/paste',{method:'POST',
+      contentType:'application/json',asJson:true,
+      body:JSON.stringify({content,title:getEffectiveContent(kw,S.links,idx,S.keywords,'','', term).title})});
+    if(!r.ok&&!r.text) throw new Error('Pastelink: '+r.error);
+    let d={}; try{d=JSON.parse(r.text);}catch(e){}
+    const pasteId=d.paste_key||d.id||d.link||d.slug;
+    if(!pasteId) throw new Error('Pastelink: '+r.text.slice(0,100));
     return 'https://pastelink.net/'+pasteId;
   }
 
   if(pid==='ideone'){
-    // Ideone — POST via JSON API (public, language=text)
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','ideone.com');
-    const r=await fetch('https://ideone.com/api/1/service/ideone/createSubmission',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({user:'guest',pass:'guest',sourceCode:content,language:43,input:'',run:false,private:false,stdRecv:false})});
-    const d=await r.json();
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','ideone.com').body;
+    const r=await pasteProxyFetch('https://ideone.com/api/1/service/ideone/createSubmission',{method:'POST',
+      contentType:'application/json',asJson:true,
+      body:JSON.stringify({user:'guest',pass:'guest',sourceCode:content,language:43,input:'',run:false,private:false,stdRecv:false}, term)});
+    if(!r.ok&&!r.text) throw new Error('Ideone: '+r.error);
+    let d={}; try{d=JSON.parse(r.text);}catch(e){}
     const link=d.result&&d.result.link;
-    if(!link) throw new Error('Ideone: '+JSON.stringify(d).slice(0,100));
+    if(!link) throw new Error('Ideone: '+r.text.slice(0,100));
     return 'https://ideone.com/'+link;
   }
 
   if(pid==='controlc'){
-    // ControlC — POST form data
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','controlc.com');
-    const r=await fetch('https://controlc.com/index.php',{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:new URLSearchParams({paste_data:content,paste_title:kw+' Guide '+year(),expire:'0',submit:'Submit'}).toString()});
-    // ControlC redirects to the paste URL
-    if(r.url&&r.url!=='https://controlc.com/index.php') return r.url;
-    const text=await r.text();
-    const m=text.match(/controlc\.com\/([a-f0-9]+)/i);
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','controlc.com').body;
+    const r=await pasteProxyFetch('https://controlc.com/index.php',{method:'POST',
+      contentType:'application/x-www-form-urlencoded',
+      body:new URLSearchParams({paste_data:content,paste_title:getEffectiveContent(kw,S.links,idx,S.keywords,'','', term).title,expire:'0',submit:'Submit'}).toString()});
+    if(r.redirected && r.text && r.text.includes('controlc.com/')){
+      const mu=r.text.match(/controlc\.com\/([a-f0-9]+)/i); if(mu) return 'https://controlc.com/'+mu[1];
+    }
+    const m=r.text&&r.text.match(/controlc\.com\/([a-f0-9]+)/i);
     if(m) return 'https://controlc.com/'+m[1];
-    throw new Error('ControlC: could not extract paste URL');
+    throw new Error('ControlC: could not extract paste URL — '+(r.error||r.text.slice(0,80)));
   }
 
   if(pid==='rentry'){
-    // Rentry.co — POST with csrftoken + text + optional edit code
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','rentry.co');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','rentry.co').body;
     const editCode=extraVal||Math.random().toString(36).slice(2,10);
-    // First get CSRF token
-    const csrf_r=await fetch('https://rentry.co/',{credentials:'include'});
-    const csrf_text=await csrf_r.text();
+    term.add('  Fetching CSRF from rentry.co...','info');
+    const csrf_r=await pasteProxyFetch('https://rentry.co/', term);
+    const csrf_text=csrf_r.text||'';
     const csrf_m=csrf_text.match(/csrfmiddlewaretoken.*?value="([^"]+)"/);
     const csrf=csrf_m&&csrf_m[1]||'';
-    const cookies=csrf_r.headers.get('set-cookie')||'';
-    const csrfCookie=cookies.match(/csrftoken=([^;]+)/);
-    const r=await fetch('https://rentry.co/api/new',{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded','Referer':'https://rentry.co/','X-CSRFToken':csrf,'Cookie':csrfCookie?'csrftoken='+csrfCookie[1]:''},
-      body:new URLSearchParams({csrfmiddlewaretoken:csrf,text:content,edit_code:editCode}).toString()});
-    const d=await r.json();
-    if(d.status!=='200'&&d.status!==200) throw new Error('Rentry: '+JSON.stringify(d).slice(0,120));
-    return d.url||'https://rentry.co/'+d.url_slug;
+    const r=await pasteProxyFetch('https://rentry.co/api/new',{method:'POST',
+      contentType:'application/x-www-form-urlencoded',
+      extraHeaders:{'Referer':'https://rentry.co/','X-CSRFToken':csrf},
+      body:new URLSearchParams({csrfmiddlewaretoken:csrf,text:content,edit_code:editCode}, term).toString()});
+    let d={}; try{d=JSON.parse(r.text);}catch(e){}
+    if(d.status!=='200'&&d.status!==200) throw new Error('Rentry: '+r.text.slice(0,120));
+    return d.url||'https://rentry.co/'+(d.url_slug||'');
   }
 
   // ── NEW PASTE PLATFORMS ────────────────────────────────────────
 
   if(pid==='rentryorg'){
-    // Rentry.org — same API as rentry.co, different domain
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','rentry.org');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','rentry.org').body;
     const editCode=extraVal||Math.random().toString(36).slice(2,10);
-    term.add('  Fetching CSRF token from rentry.org...','info');
-    const csrf_r=await fetch('https://rentry.org/',{credentials:'include'});
-    const csrf_text=await csrf_r.text();
-    const csrf_m=csrf_text.match(/csrfmiddlewaretoken.*?value="([^"]+)"/);
-    const csrf=csrf_m&&csrf_m[1]||'';
-    const cookies=csrf_r.headers.get('set-cookie')||'';
-    const csrfCookie=cookies.match(/csrftoken=([^;]+)/);
-    const r=await fetch('https://rentry.org/api/new',{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded','Referer':'https://rentry.org/','X-CSRFToken':csrf,'Cookie':csrfCookie?'csrftoken='+csrfCookie[1]:''},
-      body:new URLSearchParams({csrfmiddlewaretoken:csrf,text:content,edit_code:editCode}).toString()});
-    const d=await r.json();
-    if(d.status!=='200'&&d.status!==200) throw new Error('Rentry.org: '+JSON.stringify(d).slice(0,120));
-    return d.url||'https://rentry.org/'+d.url_slug;
+    term.add('  Fetching CSRF from rentry.org...','info');
+    const csrf_r2=await pasteProxyFetch('https://rentry.org/', term);
+    const csrf_text2=csrf_r2.text||'';
+    const csrf_m2=csrf_text2.match(/csrfmiddlewaretoken.*?value="([^"]+)"/);
+    const csrf2=csrf_m2&&csrf_m2[1]||'';
+    const r=await pasteProxyFetch('https://rentry.org/api/new',{method:'POST',
+      contentType:'application/x-www-form-urlencoded',
+      extraHeaders:{'Referer':'https://rentry.org/','X-CSRFToken':csrf2},
+      body:new URLSearchParams({csrfmiddlewaretoken:csrf2,text:content,edit_code:editCode}, term).toString()});
+    let d={}; try{d=JSON.parse(r.text);}catch(e){}
+    if(d.status!=='200'&&d.status!==200) throw new Error('Rentry.org: '+r.text.slice(0,120));
+    return d.url||'https://rentry.org/'+(d.url_slug||'');
   }
 
   if(pid==='pastebin'){
-    // Pastebin.com — POST to API with dev key; returns URL directly in body
     const apiKey=extraVal||account.extra||account.token||'';
     if(!apiKey) throw new Error('Pastebin: API key required — get it free at pastebin.com/doc_api');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','pastebin.com');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','pastebin.com').body;
     term.add('  Submitting paste to Pastebin...','info');
-    const r=await fetch('https://pastebin.com/api/api_post.php',{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    const r=await pasteProxyFetch('https://pastebin.com/api/api_post.php',{method:'POST',
+      contentType:'application/x-www-form-urlencoded',
       body:new URLSearchParams({
         api_dev_key:apiKey,
         api_paste_code:content,
-        api_paste_name:kw+' — Guide '+year(),
+        api_paste_name:getEffectiveContent(kw,S.links,idx,S.keywords,'','', term).title,
         api_paste_expire_date:'N',
         api_paste_format:'markdown',
         api_paste_private:'0',
         api_option:'paste'
       }).toString()});
-    const text=await r.text();
-    if(!text.startsWith('https://')) throw new Error('Pastebin: '+(text||'unknown error — check API key'));
-    return text.trim();
+    const text=(r.text||'').trim();
+    if(!text.startsWith('https://')) throw new Error('Pastebin: '+(text||r.error||'unknown error — check API key'));
+    return text;
   }
 
   if(pid==='dpaste'){
-    // dpaste.org — form POST, returns URL in response body (plain text)
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','dpaste.org');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','dpaste.org').body;
     term.add('  Submitting paste to dpaste.org...','info');
-    const r=await fetch('https://dpaste.org/api/',{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'text/plain'},
-      body:new URLSearchParams({content,syntax:'text',expiry_days:'365',title:kw}).toString()});
-    const text=await r.text();
-    const url=(text||'').trim().replace(/"/g,'');
-    if(!url.startsWith('http')) throw new Error('dpaste.org: unexpected response — '+text.slice(0,80));
+    const r=await pasteProxyFetch('https://dpaste.org/api/',{method:'POST',
+      contentType:'application/x-www-form-urlencoded',
+      body:new URLSearchParams({content,syntax:'text',expiry_days:'365',title:kw}, term).toString()});
+    const url=(r.text||'').trim().replace(/"/g,'');
+    if(!url.startsWith('http')) throw new Error('dpaste.org: '+(r.error||r.text.slice(0,80)));
     return url;
   }
 
   if(pid==='hastebin'){
-    // Hastebin — POST raw text body to /documents, returns {"key":"xxxx"}
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','hastebin.com');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','hastebin.com').body;
     term.add('  Submitting paste to Hastebin...','info');
-    const r=await fetch('https://hastebin.com/documents',{method:'POST',
-      headers:{'Content-Type':'text/plain'},
-      body:content});
-    const d=await r.json();
-    if(!d.key) throw new Error('Hastebin: no key returned — '+JSON.stringify(d).slice(0,80));
+    const r=await pasteProxyFetch('https://hastebin.com/documents',{method:'POST',
+      contentType:'text/plain',body:content}, term);
+    let d={}; try{d=JSON.parse(r.text);}catch(e){}
+    if(!d.key) throw new Error('Hastebin: '+(r.error||r.text.slice(0,80)));
     return 'https://hastebin.com/'+d.key;
   }
 
   if(pid==='writeas'){
-    // Write.as — POST JSON, anonymous post, returns slug in data.slug
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','write.as');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','write.as').body;
     term.add('  Publishing post to Write.as...','info');
-    const r=await fetch('https://write.as/api/posts',{method:'POST',
-      headers:{'Content-Type':'application/json','Accept':'application/json'},
-      body:JSON.stringify({body:content,title:kw+' — Complete Guide '+year(),font:'serif',lang:'en'})});
-    const d=await r.json();
-    if(!d.data||!d.data.slug) throw new Error('Write.as: '+JSON.stringify(d).slice(0,100));
+    const r=await pasteProxyFetch('https://write.as/api/posts',{method:'POST',
+      contentType:'application/json',asJson:true,
+      body:JSON.stringify({body:content,title:getEffectiveContent(kw,S.links,idx,S.keywords,'','', term).title,font:'serif',lang:'en'})});
+    let d={}; try{d=JSON.parse(r.text);}catch(e){}
+    if(!d.data||!d.data.slug) throw new Error('Write.as: '+(r.error||r.text.slice(0,100)));
     return 'https://write.as/'+d.data.slug;
   }
 
   if(pid==='pastee'){
-    // Paste.ee — POST JSON with API key, returns paste URL in id field
     const apiKey=extraVal||account.extra||account.token||'';
     if(!apiKey) throw new Error('Paste.ee: API key required — free at paste.ee/account/api');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','paste.ee');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','paste.ee').body;
     term.add('  Submitting paste to Paste.ee...','info');
-    const r=await fetch('https://paste.ee/api',{method:'POST',
-      headers:{'Content-Type':'application/json','Accept':'application/json','X-Auth-Token':apiKey},
+    const r=await pasteProxyFetch('https://paste.ee/api',{method:'POST',
+      contentType:'application/json',asJson:true,
+      extraHeaders:{'X-Auth-Token':apiKey},
       body:JSON.stringify({
         key:'public',
-        description:kw+' — Complete Guide '+year(),
+        description:getEffectiveContent(kw,S.links,idx,S.keywords,'','', term).title,
         sections:[{name:kw,syntax:'text',contents:content}]
       })});
-    const d=await r.json();
-    if(!d.id&&!d.link) throw new Error('Paste.ee: '+JSON.stringify(d).slice(0,100));
+    let d={}; try{d=JSON.parse(r.text);}catch(e){}
+    if(!d.id&&!d.link) throw new Error('Paste.ee: '+(r.error||r.text.slice(0,100)));
     return d.link||'https://paste.ee/p/'+d.id;
   }
 
   if(pid==='justpaste'){
-    // JustPaste.it — scrape CSRF from homepage, then POST article anonymously
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','justpaste.it');
-    term.add('  Fetching CSRF token from JustPaste.it...','info');
-    const homeR=await fetch('https://justpaste.it/',{credentials:'include'});
-    const homeText=await homeR.text();
-    // Extract CSRF token from meta tag or hidden input
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','justpaste.it').body;
+    term.add('  Fetching CSRF from JustPaste.it...','info');
+    const homeR=await pasteProxyFetch('https://justpaste.it/', term);
+    const homeText=homeR.text||'';
     const metaM=homeText.match(/<meta[^>]+name=["']?csrf-token["']?[^>]+content=["']([^"']+)["']/i);
     const inputM=homeText.match(/name=["']?_?csrf[_-]?token["']?[^>]+value=["']([^"']+)["']/i);
     const csrf2=(metaM&&metaM[1])||(inputM&&inputM[1])||'';
-    const cookieHdr=homeR.headers.get('set-cookie')||'';
-    const sessionCookie=cookieHdr.match(/PHPSESSID=([^;]+)/);
-    term.add('  Posting article...','info');
-    const postR=await fetch('https://justpaste.it/api/v1/articles',{method:'POST',
-      headers:{
-        'Content-Type':'application/json','Accept':'application/json',
-        'X-CSRF-Token':csrf2,
-        'Cookie':sessionCookie?'PHPSESSID='+sessionCookie[1]:''
-      },
-      body:JSON.stringify({title:kw+' — Complete Guide '+year(),body:content,visibility:'public'})});
-    const postD=await postR.json();
+    term.add('  Posting to JustPaste.it...','info');
+    const postR=await pasteProxyFetch('https://justpaste.it/api/v1/articles',{method:'POST',
+      contentType:'application/json',asJson:true,
+      extraHeaders:{'X-CSRF-Token':csrf2},
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','', term).title,body:content,visibility:'public'})});
+    let postD={}; try{postD=JSON.parse(postR.text);}catch(e){}
     const alias=postD.alias||postD.id||postD.articleId;
-    if(!alias) throw new Error('JustPaste.it: '+JSON.stringify(postD).slice(0,120));
+    if(!alias) throw new Error('JustPaste.it: '+(postR.error||postR.text.slice(0,120)));
     return 'https://justpaste.it/'+alias;
   }
 
   if(pid==='zerobin'){
-    // 0bin.net — POST form with base64-encoded content, no login needed
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','0bin.net');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','0bin.net').body;
     term.add('  Submitting paste to 0bin.net...','info');
-    const r=await fetch('https://0bin.net/paste',{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:new URLSearchParams({content,expire_after:'never'}).toString()});
-    // 0bin redirects to the paste URL on success
-    if(r.url&&r.url.includes('/paste/')&&r.url!=='https://0bin.net/paste') return r.url;
-    const text=await r.text();
-    const m=text.match(/href=["'](\/paste\/[^"']+)["']/i);
+    const r=await pasteProxyFetch('https://0bin.net/paste',{method:'POST',
+      contentType:'application/x-www-form-urlencoded',
+      body:new URLSearchParams({content,expire_after:'never'}, term).toString()});
+    const m=r.text&&r.text.match(/href=["'](\/paste\/[^"']+)["']/i);
     if(m) return 'https://0bin.net'+m[1];
-    throw new Error('0bin.net: could not extract paste URL');
+    throw new Error('0bin.net: '+(r.error||r.text.slice(0,80)));
   }
 
   if(pid==='ghgist'){
     // GitHub Gist — reuse existing GitHub account token
     const ghAccount=S.accounts.find(a=>a.platform==='github');
     if(!ghAccount) throw new Error('GitHub Gist: Connect a GitHub account first in Setup → GitHub Pages');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,ghAccount.login,'gist.github.com');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,ghAccount.login,'gist.github.com').body;
     const desc=(extraVal||'SEO guide')+' — '+kw;
     term.add('  Creating public Gist as '+ghAccount.login+'...','info');
-    const r=await fetch('https://api.github.com/gists',{method:'POST',
+    const r=await smartFetch('https://api.github.com/gists',{method:'POST',
       headers:{'Authorization':'token '+ghAccount.token,'Content-Type':'application/json','Accept':'application/vnd.github+json'},
       body:JSON.stringify({
         description:desc,
@@ -4308,22 +4628,22 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   }
 
   if(pid==='hackmd'){
-    // HackMD — POST JSON with API token, creates a public note
     const apiToken=extraVal||account.extra||account.token||'';
     if(!apiToken) throw new Error('HackMD: API token required — create one in HackMD Settings → API');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','hackmd.io');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,'anon','hackmd.io').body;
     term.add('  Creating HackMD note...','info');
-    const r=await fetch('https://api.hackmd.io/v1/notes',{method:'POST',
-      headers:{'Content-Type':'application/json','Accept':'application/json','Authorization':'Bearer '+apiToken},
+    const r=await pasteProxyFetch('https://api.hackmd.io/v1/notes',{method:'POST',
+      contentType:'application/json',asJson:true,
+      extraHeaders:{'Authorization':'Bearer '+apiToken},
       body:JSON.stringify({
-        title:kw+' — Complete Guide '+year(),
+        title:getEffectiveContent(kw,S.links,idx,S.keywords,'','', term).title,
         content:content,
         readPermission:'guest',
         writePermission:'owner',
         commentPermission:'everyone'
       })});
-    const d=await r.json();
-    if(!d.publishLink&&!d.id) throw new Error('HackMD: '+(d.message||JSON.stringify(d).slice(0,100)));
+    let d={}; try{d=JSON.parse(r.text);}catch(e){}
+    if(!d.publishLink&&!d.id) throw new Error('HackMD: '+(r.error||r.text.slice(0,100)));
     return d.publishLink||'https://hackmd.io/'+d.id;
   }
 
@@ -4333,18 +4653,18 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     // TechPlanet.today — login then POST article via form
     const password=extraVal||account.extra||'';
     if(!password) throw new Error('TechPlanet: password required');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'techplanet.today');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'techplanet.today').body;
     // Login
-    const loginR=await fetch('https://techplanet.today/api/login',{method:'POST',
+    const loginR=await smartFetch('https://techplanet.today/api/login',{method:'POST',
       headers:{'Content-Type':'application/json','Accept':'application/json'},
       body:JSON.stringify({email:account.login,password})});
     const loginD=await loginR.json();
     const token2=loginD.token||loginD.access_token||loginD.data&&loginD.data.token;
     if(!token2) throw new Error('TechPlanet login failed: '+(loginD.message||'invalid credentials'));
     // Post
-    const postR=await fetch('https://techplanet.today/api/posts',{method:'POST',
+    const postR=await smartFetch('https://techplanet.today/api/posts',{method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+token2,'Accept':'application/json'},
-      body:JSON.stringify({title:kw+': Complete Guide '+year(),body:content,status:'published',type:'post'})});
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,body:content,status:'published',type:'post'})});
     const postD=await postR.json();
     const postSlug=postD.slug||postD.data&&postD.data.slug;
     return postSlug?'https://techplanet.today/post/'+postSlug:'https://techplanet.today';
@@ -4354,16 +4674,16 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     // Click4R — login then create post
     const password=extraVal||account.extra||'';
     if(!password) throw new Error('Click4R: password required');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'click4r.com');
-    const loginR=await fetch('https://www.click4r.com/api/auth/login',{method:'POST',
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'click4r.com').body;
+    const loginR=await smartFetch('https://www.click4r.com/api/auth/login',{method:'POST',
       headers:{'Content-Type':'application/json','Accept':'application/json'},
       body:JSON.stringify({username:account.login,password})});
     const loginD=await loginR.json();
     const tok=loginD.token||loginD.access_token||loginD.data&&loginD.data.token;
     if(!tok) throw new Error('Click4R login failed: '+(loginD.message||'check credentials'));
-    const postR=await fetch('https://www.click4r.com/api/posts',{method:'POST',
+    const postR=await smartFetch('https://www.click4r.com/api/posts',{method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+tok},
-      body:JSON.stringify({title:kw+': Complete Guide '+year(),content,status:'published'})});
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,content,status:'published'})});
     const postD=await postR.json();
     const pid2=postD.id||postD.data&&postD.data.id;
     return pid2?'https://www.click4r.com/posts/g/'+pid2+'/':'https://www.click4r.com';
@@ -4372,16 +4692,16 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   if(pid==='writeonwall'){
     const password=extraVal||account.extra||'';
     if(!password) throw new Error('WriteOnWall: password required');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'writeonwall.com');
-    const loginR=await fetch('https://writeonwall.com/api/login',{method:'POST',
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'writeonwall.com').body;
+    const loginR=await smartFetch('https://writeonwall.com/api/login',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({username:account.login,password})});
     const loginD=await loginR.json();
     const tok=loginD.token||loginD.access_token;
     if(!tok) throw new Error('WriteOnWall login failed');
-    const postR=await fetch('https://writeonwall.com/api/questions',{method:'POST',
+    const postR=await smartFetch('https://writeonwall.com/api/questions',{method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+tok},
-      body:JSON.stringify({title:kw+': Complete Guide '+year(),body:content,type:'question'})});
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,body:content,type:'question'})});
     const postD=await postR.json();
     const qSlug=postD.slug||postD.id;
     return qSlug?'https://writeonwall.com/question/'+qSlug+'/':'https://writeonwall.com';
@@ -4390,16 +4710,16 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   if(pid==='snaplant'){
     const password=extraVal||account.extra||'';
     if(!password) throw new Error('Snaplant: password required');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'snaplant.com');
-    const loginR=await fetch('http://snaplant.com/api/auth/login',{method:'POST',
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'snaplant.com').body;
+    const loginR=await smartFetch('http://snaplant.com/api/auth/login',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({username:account.login,password})});
     const loginD=await loginR.json();
     const tok=loginD.token||loginD.access_token;
     if(!tok) throw new Error('Snaplant login failed');
-    const postR=await fetch('http://snaplant.com/api/questions',{method:'POST',
+    const postR=await smartFetch('http://snaplant.com/api/questions',{method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+tok},
-      body:JSON.stringify({title:kw+': Complete Guide '+year(),body:content})});
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,body:content})});
     const postD=await postR.json();
     const qSlug=postD.slug||postD.id;
     return qSlug?'http://snaplant.com/question/'+qSlug+'/':'http://snaplant.com';
@@ -4408,16 +4728,16 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   if(pid==='theprose'){
     const password=extraVal||account.extra||'';
     if(!password) throw new Error('TheProse: password required');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'theprose.com');
-    const loginR=await fetch('https://www.theprose.com/api/v1/session',{method:'POST',
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'theprose.com').body;
+    const loginR=await smartFetch('https://www.theprose.com/api/v1/session',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({username:account.login,password})});
     const loginD=await loginR.json();
     const tok=loginD.token||loginD.session_token||loginD.access_token;
     if(!tok) throw new Error('TheProse login failed');
-    const postR=await fetch('https://www.theprose.com/api/v1/posts',{method:'POST',
+    const postR=await smartFetch('https://www.theprose.com/api/v1/posts',{method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+tok},
-      body:JSON.stringify({title:kw+': Complete Guide '+year(),body:content,publish:true})});
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,body:content,publish:true})});
     const postD=await postR.json();
     const postId=postD.id||postD.post&&postD.post.id;
     return postId?'https://www.theprose.com/post/'+postId+'/':'https://www.theprose.com';
@@ -4426,17 +4746,17 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   if(pid==='onfeetnation'){
     const password=extraVal||account.extra||'';
     if(!password) throw new Error('OnFeetNation: password required');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'onfeetnation.com');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'onfeetnation.com').body;
     // Login via Ning-style form
-    const loginR=await fetch('https://www.onfeetnation.com/api/v1/session',{method:'POST',
+    const loginR=await smartFetch('https://www.onfeetnation.com/api/v1/session',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({email:account.login,password})});
     const loginD=await loginR.json();
     const tok=loginD.token||loginD.access_token||loginD.sessionToken;
     if(!tok) throw new Error('OnFeetNation login failed — check username/password');
-    const postR=await fetch('https://www.onfeetnation.com/api/v1/albums',{method:'POST',
+    const postR=await smartFetch('https://www.onfeetnation.com/api/v1/albums',{method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+tok},
-      body:JSON.stringify({title:kw+': Complete Guide '+year(),description:content.slice(0,1000),privacy:'public'})});
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,description:content.slice(0,1000),privacy:'public'})});
     const postD=await postR.json();
     const albumId=postD.id||postD.album&&postD.album.id;
     return albumId?'https://www.onfeetnation.com/photo/albums/'+albumId:'https://www.onfeetnation.com';
@@ -4445,16 +4765,16 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   if(pid==='caribbeanfever'){
     const password=extraVal||account.extra||'';
     if(!password) throw new Error('CaribbeanFever: password required');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'caribbeanfever.com');
-    const loginR=await fetch('https://caribbeanfever.com/api/v1/session',{method:'POST',
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'caribbeanfever.com').body;
+    const loginR=await smartFetch('https://caribbeanfever.com/api/v1/session',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({email:account.login,password})});
     const loginD=await loginR.json();
     const tok=loginD.token||loginD.access_token||loginD.sessionToken;
     if(!tok) throw new Error('CaribbeanFever login failed — check username/password');
-    const postR=await fetch('https://caribbeanfever.com/api/v1/albums',{method:'POST',
+    const postR=await smartFetch('https://caribbeanfever.com/api/v1/albums',{method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+tok},
-      body:JSON.stringify({title:kw+': Complete Guide '+year(),description:content.slice(0,1000),privacy:'public'})});
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,description:content.slice(0,1000),privacy:'public'})});
     const postD=await postR.json();
     const albumId=postD.id||postD.album&&postD.album.id;
     return albumId?'https://caribbeanfever.com/photo/albums/'+albumId:'https://caribbeanfever.com';
@@ -4463,17 +4783,17 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   if(pid==='taylorhicks'){
     const password=extraVal||account.extra||'';
     if(!password) throw new Error('TaylorHicks Ning: password required');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'taylorhicks.ning.com');
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'taylorhicks.ning.com').body;
     // Ning REST API
-    const loginR=await fetch('https://external.ningapis.com/xn/rest/taylorhicks/1.0/Token',{method:'POST',
+    const loginR=await smartFetch('https://external.ningapis.com/xn/rest/taylorhicks/1.0/Token',{method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
       body:new URLSearchParams({email:account.login,password,apiKey:account.token}).toString()});
     const loginD=await loginR.json();
     const tok=loginD.token||loginD.oauthToken;
     if(!tok) throw new Error('TaylorHicks Ning login failed');
-    const postR=await fetch('https://external.ningapis.com/xn/rest/taylorhicks/1.0/BlogPost',{method:'POST',
+    const postR=await smartFetch('https://external.ningapis.com/xn/rest/taylorhicks/1.0/BlogPost',{method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+tok},
-      body:JSON.stringify({title:kw+': Complete Guide '+year(),description:content,visibility:'public'})});
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,description:content,visibility:'public'})});
     const postD=await postR.json();
     const postId=postD.id||postD.blogPost&&postD.blogPost.id;
     return postId?'https://taylorhicks.ning.com/forum/topics/'+postId:'https://taylorhicks.ning.com';
@@ -4482,10 +4802,10 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   if(pid==='vingle'){
     const interestId=extraVal||account.extra||'';
     if(!interestId) throw new Error('Vingle: Interest ID required');
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'vingle.net');
-    const postR=await fetch('https://www.vingle.net/api/cards',{method:'POST',
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'vingle.net').body;
+    const postR=await smartFetch('https://www.vingle.net/api/cards',{method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+account.token},
-      body:JSON.stringify({title:kw+': Complete Guide '+year(),body:content,interest_id:interestId,visibility:'public'})});
+      body:JSON.stringify({title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,body:content,interest_id:interestId,visibility:'public'})});
     const postD=await postR.json();
     const cardId=postD.id||postD.card&&postD.card.id;
     return cardId?'https://www.vingle.net/posts/'+cardId:'https://www.vingle.net';
@@ -4493,11 +4813,11 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
 
   if(pid==='deviantart'){
     // DeviantArt: publish journal via OAuth2 token
-    const content=generateMarkdown(kw,S.links,idx,S.keywords,account.login,'deviantart.com');
-    const r=await fetch('https://www.deviantart.com/api/v1/oauth2/stash/publish',{method:'POST',
+    const content=getEffectiveContent(kw,S.links,idx,S.keywords,account.login,'deviantart.com').body;
+    const r=await smartFetch('https://www.deviantart.com/api/v1/oauth2/stash/publish',{method:'POST',
       headers:{'Authorization':'Bearer '+account.token,'Content-Type':'application/x-www-form-urlencoded'},
       body:new URLSearchParams({
-        title:kw+': Complete Guide '+year(),
+        title:getEffectiveContent(kw,S.links,idx,S.keywords,'','').title,
         artist_comments:content.slice(0,10000),
         is_mature:'false',
         agree_submission:'true',
@@ -4698,6 +5018,7 @@ function renderGlobalBlast(el){
       <div class="fg mb0"><label class="lbl">Delay Between Posts (sec)</label>
         <input type="number" id="blast-delay" value="4" min="1" max="120"/></div>
     </div>
+    ${(()=>{ const _blastType=blastDominantFieldType(); const _fakePid=Object.keys(PLATFORM_META).find(k=>(PLATFORM_META[k].type||'article')===_blastType)||(_blastSelectedPlatforms[0]||PLATFORMS[0].id); return renderContentFields(_fakePid,'blast'); })()}
     <div class="notice notice-info mt8" id="blast-estimate" style="margin-bottom:8px">
       Select platforms and set delay to see estimated time.
     </div>
@@ -4721,6 +5042,7 @@ function renderGlobalBlast(el){
   </div>`;
   updateBlastEstimate();
 }
+
 function toggleBlastPlatform(id){
   const isConn=S.accounts.some(a=>a.platform===id); if(!isConn) return;
   if(_blastSelectedPlatforms.includes(id)) _blastSelectedPlatforms=_blastSelectedPlatforms.filter(x=>x!==id);
@@ -4742,6 +5064,7 @@ async function runGlobalBlast(){
   const kwEl=document.getElementById('blast-kw');
   const prefixEl=document.getElementById('blast-prefix');
   const delayEl=document.getElementById('blast-delay');
+  syncContentFields('blast'); // sync all content fields from DOM before blast
   const singleKw=kwEl&&kwEl.value.trim();
   const effectiveKws=singleKw?[singleKw]:(S.keywords.length?S.keywords:null);
   if(!effectiveKws){ toast('Add keywords in the Keywords page first','w'); return; }
@@ -7324,7 +7647,7 @@ async function apPostGitHub(site, title, content){
   const htmlContent = `<!DOCTYPE html><html><head><title>${title}</title></head><body><h1>${title}</h1><p>${content}</p><a href="${site.url}">${site.url}</a></body></html>`;
   const encoded = btoa(unescape(encodeURIComponent(htmlContent)));
   try {
-    const resp = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+    const resp = await smartFetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
       method: 'PUT',
       headers: { 'Authorization': `token ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: `Add: ${title}`, content: encoded, branch })
@@ -7341,7 +7664,7 @@ async function apPostNetlify(site, title, content){
   try {
     // Create a new site then deploy
     const siteName = 'seo-ap-' + Date.now();
-    const createResp = await fetch('https://api.netlify.com/api/v1/sites', {
+    const createResp = await smartFetch('https://api.netlify.com/api/v1/sites', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: siteName })
@@ -7353,7 +7676,7 @@ async function apPostNetlify(site, title, content){
     // Deploy via zip
     const enc = new TextEncoder();
     const fileBytes = enc.encode(htmlContent);
-    const deployResp = await fetch(`https://api.netlify.com/api/v1/sites/${siteId}/deploys`, {
+    const deployResp = await smartFetch(`https://api.netlify.com/api/v1/sites/${siteId}/deploys`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/zip' },
       body: fileBytes
@@ -7371,7 +7694,7 @@ async function apPostWordPress(site, title, content){
   if(!siteUrl||!username||!appPw) return {success:false, msg:'Missing WordPress credentials'};
   try {
     const auth = btoa(username + ':' + appPw);
-    const resp = await fetch(`${siteUrl}/wp-json/wp/v2/posts`, {
+    const resp = await smartFetch(`${siteUrl}/wp-json/wp/v2/posts`, {
       method: 'POST',
       headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ title, content, status: 'publish' })
@@ -7387,7 +7710,7 @@ async function apPostBlogger(site, title, content){
   const blogId = _apCredentials.blog_id;
   if(!apiKey||!blogId) return {success:false, msg:'Missing Blogger API key or Blog ID'};
   try {
-    const resp = await fetch(`https://www.googleapis.com/blogger/v3/blogs/${blogId}/posts/?key=${apiKey}`, {
+    const resp = await smartFetch(`https://www.googleapis.com/blogger/v3/blogs/${blogId}/posts/?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'blogger#post', title, content })
@@ -7402,13 +7725,14 @@ async function apPostMedium(site, title, content){
   const token = _apCredentials.token;
   if(!token) return {success:false, msg:'Missing Medium token'};
   try {
-    const userResp = await fetch('https://api.medium.com/v1/me', {
+    const userResp = await smartFetch('https://api.medium.com/v1/me', {
+      method: 'GET',
       headers: { 'Authorization': `Bearer ${token}` }
     });
     const userData = await userResp.json();
     if(!userResp.ok) return {success:false, msg:'Invalid Medium token'};
     const userId = userData.data&&userData.data.id;
-    const resp = await fetch(`https://api.medium.com/v1/users/${userId}/posts`, {
+    const resp = await smartFetch(`https://api.medium.com/v1/users/${userId}/posts`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ title, contentFormat: 'html', content: `<h1>${title}</h1><p>${content}</p><p><a href="${site.url}">${site.url}</a></p>`, publishStatus: 'public' })
@@ -7426,7 +7750,7 @@ async function apPostCustomWebhook(site, title, content){
   try {
     const headers = { 'Content-Type': 'application/json' };
     if(authHeader) headers['Authorization'] = authHeader;
-    const resp = await fetch(url, {
+    const resp = await smartFetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify({ title, content, source_url: site.url, label: site.label })
@@ -9780,7 +10104,7 @@ async function pmFetchSrc(src){
   const tryUrls = [src.url, pmCorsUrl(src.url)];
   for(const url of tryUrls){
     try{
-      const r=await fetch(url,{signal:AbortSignal.timeout(15000)});
+      const r=await smartFetch(url,{method:'GET',sfTimeout:15000});
       if(!r.ok) continue;
       const text=await r.text();
       let proxies=pmParse(text,src.format,src.name);
@@ -10211,7 +10535,7 @@ async function puAttemptFormUpload(job,blob,file,siteUrl,endpoint,creds){
   const endFull=endpoint.startsWith('http')?endpoint:origin+endpoint;
   for(const url of [endFull,'https://corsproxy.io/?'+encodeURIComponent(endFull)]){
     try{
-      const r=await fetch(url,{method:'POST',body:fd,headers:hdrs,signal:AbortSignal.timeout(30000)});
+      const r=await smartFetch(url,{method:'POST',body:fd,headers:hdrs,sfTimeout:30000});
       const text=await r.text();
       const extracted=puExtractUrl(text,siteUrl);
       if(extracted) return{success:true,url:extracted};
@@ -10225,7 +10549,7 @@ async function puArchiveOrg(job,blob,file,creds){
   if(!creds.apiKey&&!creds.user) return{success:false,manual:true,message:'Archive.org needs S3 keys (username=Access Key, API Key=Secret Key)'};
   const id='parasite-'+slug(creds.title||file.name)+'-'+Date.now();
   try{
-    const r=await fetch('https://s3.us.archive.org/'+id+'/'+encodeURIComponent(file.name),{
+    const r=await smartFetch('https://s3.us.archive.org/'+id+'/'+encodeURIComponent(file.name),{
       method:'PUT',body:blob,signal:AbortSignal.timeout(60000),
       headers:{'Authorization':'LOW '+creds.user+':'+creds.apiKey,'x-archive-meta-title':creds.title||file.name,'x-archive-meta-mediatype':'texts','Content-Type':'application/pdf','x-amz-auto-make-bucket':'1'}
     });
@@ -10641,7 +10965,7 @@ async function gscInspectUrl(url, apiKey, siteUrl){
   // Method 1: Real Google Search Console URL Inspection API (requires OAuth token as apiKey)
   if(apiKey && siteUrl){
     try{
-      const r = await fetch('https://searchconsole.googleapis.com/v1/urlInspection/index:inspect', {
+      const r = await smartFetch('https://searchconsole.googleapis.com/v1/urlInspection/index:inspect', {
         method:'POST',
         headers:{'Authorization':'Bearer '+apiKey,'Content-Type':'application/json'},
         body: JSON.stringify({inspectionUrl:url,siteUrl}),
@@ -10865,7 +11189,7 @@ async function liSubmitBatch(){
           ok = r.status === 200 || r.status === 202;
         } else if(svc === 'gindex' && apiKey){
           // Google Indexing API (requires OAuth token as apiKey)
-          const r = await fetch('https://indexing.googleapis.com/v3/urlNotifications:publish', {
+          const r = await smartFetch('https://indexing.googleapis.com/v3/urlNotifications:publish', {
             method:'POST', headers:{'Authorization':'Bearer '+apiKey,'Content-Type':'application/json'},
             body: JSON.stringify({url, type:'URL_UPDATED'}), signal:AbortSignal.timeout(10000)
           });
@@ -11603,7 +11927,7 @@ async function ssbRunBlast(){
       try{
         if(pid === 'pinterest' && key1){
           // Real Pinterest API v5
-          const r = await fetch('https://api.pinterest.com/v5/pins', {
+          const r = await smartFetch('https://api.pinterest.com/v5/pins', {
             method:'POST', headers:{'Authorization':'Bearer '+key1,'Content-Type':'application/json'},
             body:JSON.stringify({link:url,title:title||url,description:desc,board_id:'',media_source:imageUrl?{source_type:'image_url',url:imageUrl}:undefined}),
             signal:AbortSignal.timeout(10000)
@@ -11611,7 +11935,7 @@ async function ssbRunBlast(){
           if(r.ok){ const d=await r.json(); postUrl=d.id?`https://www.pinterest.com/pin/${d.id}/`:null; success=true; }
         } else if(pid === 'reddit' && key2){
           // Real Reddit API OAuth
-          const r = await fetch('https://oauth.reddit.com/api/submit', {
+          const r = await smartFetch('https://oauth.reddit.com/api/submit', {
             method:'POST', headers:{'Authorization':'Bearer '+key2,'Content-Type':'application/x-www-form-urlencoded','User-Agent':'SEOParasite/1.0'},
             body:`sr=self&kind=link&title=${encodeURIComponent(title||url)}&url=${encodeURIComponent(url)}&resubmit=true`,
             signal:AbortSignal.timeout(10000)
@@ -13303,7 +13627,7 @@ async function fsRunNow(id){
     else if(platform==='github' && postId){
       // GitHub: update file content
       const enc = encodeURIComponent(postId);
-      const r = await fetch(`https://api.github.com/repos/${postId}`, {
+      const r = await smartFetch(`https://api.github.com/repos/${postId}`, {
         method:'PUT', headers:{'Authorization':'Bearer '+apiKey,'Content-Type':'application/json'},
         body:JSON.stringify({message:'Freshness update '+new Date().toISOString().split('T')[0],content:btoa(unescape(encodeURIComponent(mutated)))}),
         signal:AbortSignal.timeout(12000)
@@ -16277,20 +16601,20 @@ async function ahCheckAll(){
 }
 
 // Individual API test functions
-async function ahTestGitHub(){ const token=getAccount('github')?.token; if(!token) return false; const r=await fetch('https://api.github.com/user',{headers:{Authorization:'token '+token}}); return r.ok; }
-async function ahTestMedium(){ const token=getAccount('medium')?.token; if(!token) return false; const r=await fetch('https://api.medium.com/v1/me',{headers:{Authorization:'Bearer '+token}}); return r.ok; }
-async function ahTestDevTo(){ const key=getAccount('devto')?.token; if(!key) return false; const r=await fetch('https://dev.to/api/users/me',{headers:{'api-key':key}}); return r.ok; }
-async function ahTestSerpApi(){ const key=settingGet('serp_serpApiKey'); if(!key) return false; const r=await fetch(`https://serpapi.com/account.json?api_key=${key}`); return r.ok; }
-async function ahTest2Captcha(){ const key=settingGet('cap_2captchaKey'); if(!key) return false; const r=await fetch(`https://2captcha.com/res.php?action=getbalance&key=${key}&json=1`); if(!r.ok) return false; const d=await r.json(); return d.status===1&&parseFloat(d.request)>0; }
-async function ahTestAntiCaptcha(){ const key=settingGet('cap_antiCaptchaKey'); if(!key) return false; const r=await fetch('https://api.anti-captcha.com/getBalance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clientKey:key})}); if(!r.ok) return false; const d=await r.json(); return d.errorId===0; }
+async function ahTestGitHub(){ const token=getAccount('github')?.token; if(!token) return false; const r=await smartFetch('https://api.github.com/user',{method:'GET',headers:{Authorization:'token '+token}}); return r.ok; }
+async function ahTestMedium(){ const token=getAccount('medium')?.token; if(!token) return false; const r=await smartFetch('https://api.medium.com/v1/me',{method:'GET',headers:{Authorization:'Bearer '+token}}); return r.ok; }
+async function ahTestDevTo(){ const key=getAccount('devto')?.token; if(!key) return false; const r=await smartFetch('https://dev.to/api/users/me',{method:'GET',headers:{'api-key':key}}); return r.ok; }
+async function ahTestSerpApi(){ const key=settingGet('serp_serpApiKey'); if(!key) return false; const r=await smartFetch(`https://serpapi.com/account.json?api_key=${key}`,{method:'GET'}); return r.ok; }
+async function ahTest2Captcha(){ const key=settingGet('cap_2captchaKey'); if(!key) return false; const r=await smartFetch(`https://2captcha.com/res.php?action=getbalance&key=${key}&json=1`,{method:'GET'}); if(!r.ok) return false; const d=await r.json(); return d.status===1&&parseFloat(d.request)>0; }
+async function ahTestAntiCaptcha(){ const key=settingGet('cap_antiCaptchaKey'); if(!key) return false; const r=await smartFetch('https://api.anti-captcha.com/getBalance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clientKey:key})}); if(!r.ok) return false; const d=await r.json(); return d.errorId===0; }
 async function ahTestIndexNow(){ return !!(settingGet('li_indexNowKey')); }
 async function ahTestSupabase(){ return !!(settingGet('supa_connected')); }
-async function ahTestWordpress(){ const token=getAccount('wordpress')?.token; if(!token) return false; const r=await fetch('https://public-api.wordpress.com/rest/v1/me/',{headers:{Authorization:'Bearer '+token}}); return r.ok; }
-async function ahTestNotion(){ const token=getAccount('notion')?.token; if(!token) return false; const r=await fetch('https://api.notion.com/v1/users/me',{headers:{Authorization:'Bearer '+token,'Notion-Version':'2022-06-28'}}); return r.ok; }
-async function ahTestHashnode(){ const token=getAccount('hashnode')?.token; if(!token) return false; const r=await fetch('https://gql.hashnode.com/',{method:'POST',headers:{Authorization:token,'Content-Type':'application/json'},body:'{"query":"{me{id}}"}'}); return r.ok; }
-async function ahTestNetlify(){ const token=getAccount('netlify')?.token; if(!token) return false; const r=await fetch('https://api.netlify.com/api/v1/user',{headers:{Authorization:'Bearer '+token}}); return r.ok; }
+async function ahTestWordpress(){ const token=getAccount('wordpress')?.token; if(!token) return false; const r=await smartFetch('https://public-api.wordpress.com/rest/v1/me/',{method:'GET',headers:{Authorization:'Bearer '+token}}); return r.ok; }
+async function ahTestNotion(){ const token=getAccount('notion')?.token; if(!token) return false; const r=await smartFetch('https://api.notion.com/v1/users/me',{method:'GET',headers:{Authorization:'Bearer '+token,'Notion-Version':'2022-06-28'}}); return r.ok; }
+async function ahTestHashnode(){ const token=getAccount('hashnode')?.token; if(!token) return false; const r=await smartFetch('https://gql.hashnode.com/',{method:'POST',headers:{Authorization:token,'Content-Type':'application/json'},body:'{"query":"{me{id}}"}'}); return r.ok; }
+async function ahTestNetlify(){ const token=getAccount('netlify')?.token; if(!token) return false; const r=await smartFetch('https://api.netlify.com/api/v1/user',{method:'GET',headers:{Authorization:'Bearer '+token}}); return r.ok; }
 async function ahTestGhost(){ return !!(getAccount('ghost')?.token); }
-async function ahTestReddit(){ const token=getAccount('reddit')?.token; if(!token) return false; const r=await fetch('https://oauth.reddit.com/api/v1/me',{headers:{Authorization:'Bearer '+token,'User-Agent':'SEOParasite/1.0'}}); return r.ok; }
+async function ahTestReddit(){ const token=getAccount('reddit')?.token; if(!token) return false; const r=await smartFetch('https://oauth.reddit.com/api/v1/me',{method:'GET',headers:{Authorization:'Bearer '+token,'User-Agent':'SEOParasite/1.0'}}); return r.ok; }
 async function ahTestCorsProxy(){ try{ const r=await fetch('https://corsproxy.io/?'+encodeURIComponent('https://api.github.com'),{signal:AbortSignal.timeout(5000)}); return r.ok; }catch(e){ return false; } }
 
 

@@ -4,7 +4,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>SEO PARASITE PRO v12 — Settings · Help · 22 Sources · Live APIs</title>
+<title>SEO PARASITE PRO v15 — Settings · Help · 33 Sources · Live APIs</title>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Tahoma:wght@400;700&display=swap" rel="stylesheet">
 <style>
 /* =============================================
@@ -1104,6 +1104,17 @@ const PLATFORMS = [
   {id:'snaplant',     name:'Snaplant',        icon:'🌿', da:36,  api:'Form POST',          domain:'snaplant.com',      desc:'Submit a question on Snaplant Q&A'},
   {id:'theprose',     name:'TheProse',        icon:'📖', da:42,  api:'Form POST',          domain:'theprose.com',      desc:'Publish a post on TheProse writing community'},
   {id:'deviantart',   name:'DeviantArt',      icon:'🎨', da:92,  api:'DeviantArt API',     domain:'deviantart.com',    desc:'Publish a journal/deviation on DeviantArt — DA 92'},
+  // ── PASTE SITES (batch) ──
+  {id:'pastebin',     name:'Pastebin',        icon:'📋', da:93,  api:'Paste API',          domain:'pastebin.com',      desc:'Create public paste on Pastebin.com — DA 93 (requires free API key)'},
+  {id:'dpaste',       name:'dpaste.org',      icon:'📄', da:62,  api:'REST API',           domain:'dpaste.org',        desc:'Create anonymous paste on dpaste.org — no login needed'},
+  {id:'hastebin',     name:'Hastebin',        icon:'⚡', da:55,  api:'REST API',           domain:'hastebin.com',      desc:'Create instant paste on Hastebin — no login needed'},
+  {id:'writeas',      name:'Write.as',        icon:'✍️', da:64,  api:'REST API',           domain:'write.as',          desc:'Publish anonymous post on Write.as — no login needed'},
+  {id:'pastee',       name:'Paste.ee',        icon:'📌', da:52,  api:'REST API',           domain:'paste.ee',          desc:'Create paste on Paste.ee — requires free API key'},
+  {id:'justpaste',    name:'JustPaste.it',    icon:'📎', da:65,  api:'Form POST',          domain:'justpaste.it',      desc:'Publish anonymous article on JustPaste.it — no login needed'},
+  {id:'zerobin',      name:'0bin.net',        icon:'🔒', da:44,  api:'Form POST',          domain:'0bin.net',          desc:'Encrypted paste on 0bin.net — no login needed'},
+  {id:'rentryorg',    name:'Rentry.org',      icon:'📄', da:50,  api:'Paste API',          domain:'rentry.org',        desc:'Markdown paste on Rentry.org (mirror of rentry.co)'},
+  {id:'ghgist',       name:'GitHub Gist',     icon:'📝', da:96,  api:'GitHub API',         domain:'gist.github.com',   desc:'Create public Gist — reuses your connected GitHub token — DA 96'},
+  {id:'hackmd',       name:'HackMD',          icon:'🖊', da:74,  api:'HackMD API',         domain:'hackmd.io',         desc:'Create collaborative Markdown note on HackMD — requires API token'},
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -3568,8 +3579,24 @@ async function connectAccount(pid){
       if(!extra) throw new Error('Password is required for '+getPlatform(pid).name);
       userInfo={login:token,avatar:'',id:uid()};
     }
-    else if(pid==='bitbin'||pid==='pastelink'||pid==='ideone'||pid==='controlc'||pid==='rentry'){
+    else if(pid==='bitbin'||pid==='pastelink'||pid==='ideone'||pid==='controlc'||pid==='rentry'||
+            pid==='rentryorg'||pid==='dpaste'||pid==='hastebin'||pid==='writeas'||pid==='justpaste'||pid==='zerobin'){
       userInfo={login:token||'anonymous',avatar:'',id:uid()};
+    }
+    else if(pid==='pastebin'||pid==='pastee'){
+      // These need an API key stored as token; label it clearly
+      if(!token) throw new Error(getPlatform(pid).name+': API key is required — enter it in the Token field');
+      userInfo={login:'apikey-user',avatar:'',id:uid()};
+    }
+    else if(pid==='ghgist'){
+      // Reuses GitHub account — just validate one exists
+      const ghAcc=S.accounts.find(a=>a.platform==='github');
+      if(!ghAcc) throw new Error('GitHub Gist reuses your GitHub Pages account — connect GitHub Pages first in Setup');
+      userInfo={login:ghAcc.login,avatar:ghAcc.avatar,id:uid()};
+    }
+    else if(pid==='hackmd'){
+      if(!token) throw new Error('HackMD: API token required — create one in HackMD Settings → API');
+      userInfo={login:'hackmd-user',avatar:'',id:uid()};
     }
     else if(pid==='vingle'){ userInfo={login:token||'vingle-user',avatar:'',id:uid()}; }
     else if(pid==='deviantart'){ userInfo={login:extra||token||'deviantart-user',avatar:'',id:uid()}; }
@@ -3625,6 +3652,17 @@ const PLATFORM_META = {
   snaplant:     {type:'post',    label:'Password',         ph:'your-password',            hint:'Submits a question on Snaplant Q&A. Requires username + password.',               defVal:''},
   theprose:     {type:'article', label:'Password',         ph:'your-password',            hint:'Publishes a post on TheProse. Requires username + session token/password.',       defVal:''},
   deviantart:   {type:'article', label:'Username',         ph:'your-username',            hint:'Publishes a journal entry to DeviantArt via OAuth2 access token.',                defVal:''},
+  // ── PASTE SITES ──
+  pastebin:     {type:'page',    label:'Pastebin API Key', ph:'your-api-key',             hint:'Get a free API key at pastebin.com/doc_api — required for paste creation.',       defVal:''},
+  dpaste:       {type:'page',    label:'Label',            ph:'seo-paste',                hint:'Creates an anonymous public paste on dpaste.org. No account needed.',             defVal:'seo-paste'},
+  hastebin:     {type:'page',    label:'Label',            ph:'seo-paste',                hint:'Creates an instant paste on Hastebin. No account or login required.',             defVal:'seo-paste'},
+  writeas:      {type:'page',    label:'Label',            ph:'seo-post',                 hint:'Publishes an anonymous post on Write.as. No account needed — goes live instantly.',defVal:'seo-post'},
+  pastee:       {type:'page',    label:'Paste.ee API Key', ph:'your-api-key',             hint:'Get a free API key at paste.ee — required. Create a paste with title + content.', defVal:''},
+  justpaste:    {type:'page',    label:'Edit Code',        ph:'leave blank for random',   hint:'Publishes an anonymous article on JustPaste.it via form POST. No account needed.',defVal:''},
+  zerobin:      {type:'page',    label:'Label',            ph:'seo-paste',                hint:'Submits an encrypted paste to 0bin.net. Client-side AES encrypted. No login.',    defVal:'seo-paste'},
+  rentryorg:    {type:'page',    label:'Edit Code',        ph:'leave blank for random',   hint:'Creates a Markdown page on Rentry.org (same API as rentry.co). Edit code optional.',defVal:''},
+  ghgist:       {type:'page',    label:'Gist Description', ph:'SEO guide',                hint:'Creates a public GitHub Gist. Reuses your connected GitHub account token.',        defVal:'SEO guide'},
+  hackmd:       {type:'page',    label:'HackMD API Token', ph:'your-api-token',           hint:'Create an API token in HackMD Settings → API. Publishes a public Markdown note.', defVal:''},
 };
 const TYPE_LABELS={
   file:    {badge:'badge-b',  text:'Index File Upload',  desc:'Creates a subdomain and uploads an index.html file'},
@@ -3735,6 +3773,10 @@ async function runCampaign(pid){
         const result={id:uid(),platform:pid,keyword:kw,repo:slug(extraVal+'-'+kw),url,status:'success',ts:ts()};
         S.campaigns=S.campaigns.filter(c=>!(c.platform===pid&&c.keyword===kw));
         S.campaigns.push(result);
+        // Auto-submit to indexers if enabled
+        if(settingGet('auto_index_on_publish')&&url){
+          autoSubmitToIndexers(url,term).catch(()=>{});
+        }
         urlsEl.innerHTML=`<div class="card slide-in"><div class="card-title">🚀 Live URLs</div>${liveUrls.map(u=>urlBannerHTML(u.url,u.keyword,u.platform)).join('')}</div>`;
       }
     }catch(e){
@@ -4107,6 +4149,184 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
     return d.url||'https://rentry.co/'+d.url_slug;
   }
 
+  // ── NEW PASTE PLATFORMS ────────────────────────────────────────
+
+  if(pid==='rentryorg'){
+    // Rentry.org — same API as rentry.co, different domain
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','rentry.org');
+    const editCode=extraVal||Math.random().toString(36).slice(2,10);
+    term.add('  Fetching CSRF token from rentry.org...','info');
+    const csrf_r=await fetch('https://rentry.org/',{credentials:'include'});
+    const csrf_text=await csrf_r.text();
+    const csrf_m=csrf_text.match(/csrfmiddlewaretoken.*?value="([^"]+)"/);
+    const csrf=csrf_m&&csrf_m[1]||'';
+    const cookies=csrf_r.headers.get('set-cookie')||'';
+    const csrfCookie=cookies.match(/csrftoken=([^;]+)/);
+    const r=await fetch('https://rentry.org/api/new',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded','Referer':'https://rentry.org/','X-CSRFToken':csrf,'Cookie':csrfCookie?'csrftoken='+csrfCookie[1]:''},
+      body:new URLSearchParams({csrfmiddlewaretoken:csrf,text:content,edit_code:editCode}).toString()});
+    const d=await r.json();
+    if(d.status!=='200'&&d.status!==200) throw new Error('Rentry.org: '+JSON.stringify(d).slice(0,120));
+    return d.url||'https://rentry.org/'+d.url_slug;
+  }
+
+  if(pid==='pastebin'){
+    // Pastebin.com — POST to API with dev key; returns URL directly in body
+    const apiKey=extraVal||account.extra||account.token||'';
+    if(!apiKey) throw new Error('Pastebin: API key required — get it free at pastebin.com/doc_api');
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','pastebin.com');
+    term.add('  Submitting paste to Pastebin...','info');
+    const r=await fetch('https://pastebin.com/api/api_post.php',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:new URLSearchParams({
+        api_dev_key:apiKey,
+        api_paste_code:content,
+        api_paste_name:kw+' — Guide '+year(),
+        api_paste_expire_date:'N',
+        api_paste_format:'markdown',
+        api_paste_private:'0',
+        api_option:'paste'
+      }).toString()});
+    const text=await r.text();
+    if(!text.startsWith('https://')) throw new Error('Pastebin: '+(text||'unknown error — check API key'));
+    return text.trim();
+  }
+
+  if(pid==='dpaste'){
+    // dpaste.org — form POST, returns URL in response body (plain text)
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','dpaste.org');
+    term.add('  Submitting paste to dpaste.org...','info');
+    const r=await fetch('https://dpaste.org/api/',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'text/plain'},
+      body:new URLSearchParams({content,syntax:'text',expiry_days:'365',title:kw}).toString()});
+    const text=await r.text();
+    const url=(text||'').trim().replace(/"/g,'');
+    if(!url.startsWith('http')) throw new Error('dpaste.org: unexpected response — '+text.slice(0,80));
+    return url;
+  }
+
+  if(pid==='hastebin'){
+    // Hastebin — POST raw text body to /documents, returns {"key":"xxxx"}
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','hastebin.com');
+    term.add('  Submitting paste to Hastebin...','info');
+    const r=await fetch('https://hastebin.com/documents',{method:'POST',
+      headers:{'Content-Type':'text/plain'},
+      body:content});
+    const d=await r.json();
+    if(!d.key) throw new Error('Hastebin: no key returned — '+JSON.stringify(d).slice(0,80));
+    return 'https://hastebin.com/'+d.key;
+  }
+
+  if(pid==='writeas'){
+    // Write.as — POST JSON, anonymous post, returns slug in data.slug
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','write.as');
+    term.add('  Publishing post to Write.as...','info');
+    const r=await fetch('https://write.as/api/posts',{method:'POST',
+      headers:{'Content-Type':'application/json','Accept':'application/json'},
+      body:JSON.stringify({body:content,title:kw+' — Complete Guide '+year(),font:'serif',lang:'en'})});
+    const d=await r.json();
+    if(!d.data||!d.data.slug) throw new Error('Write.as: '+JSON.stringify(d).slice(0,100));
+    return 'https://write.as/'+d.data.slug;
+  }
+
+  if(pid==='pastee'){
+    // Paste.ee — POST JSON with API key, returns paste URL in id field
+    const apiKey=extraVal||account.extra||account.token||'';
+    if(!apiKey) throw new Error('Paste.ee: API key required — free at paste.ee/account/api');
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','paste.ee');
+    term.add('  Submitting paste to Paste.ee...','info');
+    const r=await fetch('https://paste.ee/api',{method:'POST',
+      headers:{'Content-Type':'application/json','Accept':'application/json','X-Auth-Token':apiKey},
+      body:JSON.stringify({
+        key:'public',
+        description:kw+' — Complete Guide '+year(),
+        sections:[{name:kw,syntax:'text',contents:content}]
+      })});
+    const d=await r.json();
+    if(!d.id&&!d.link) throw new Error('Paste.ee: '+JSON.stringify(d).slice(0,100));
+    return d.link||'https://paste.ee/p/'+d.id;
+  }
+
+  if(pid==='justpaste'){
+    // JustPaste.it — scrape CSRF from homepage, then POST article anonymously
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','justpaste.it');
+    term.add('  Fetching CSRF token from JustPaste.it...','info');
+    const homeR=await fetch('https://justpaste.it/',{credentials:'include'});
+    const homeText=await homeR.text();
+    // Extract CSRF token from meta tag or hidden input
+    const metaM=homeText.match(/<meta[^>]+name=["']?csrf-token["']?[^>]+content=["']([^"']+)["']/i);
+    const inputM=homeText.match(/name=["']?_?csrf[_-]?token["']?[^>]+value=["']([^"']+)["']/i);
+    const csrf2=(metaM&&metaM[1])||(inputM&&inputM[1])||'';
+    const cookieHdr=homeR.headers.get('set-cookie')||'';
+    const sessionCookie=cookieHdr.match(/PHPSESSID=([^;]+)/);
+    term.add('  Posting article...','info');
+    const postR=await fetch('https://justpaste.it/api/v1/articles',{method:'POST',
+      headers:{
+        'Content-Type':'application/json','Accept':'application/json',
+        'X-CSRF-Token':csrf2,
+        'Cookie':sessionCookie?'PHPSESSID='+sessionCookie[1]:''
+      },
+      body:JSON.stringify({title:kw+' — Complete Guide '+year(),body:content,visibility:'public'})});
+    const postD=await postR.json();
+    const alias=postD.alias||postD.id||postD.articleId;
+    if(!alias) throw new Error('JustPaste.it: '+JSON.stringify(postD).slice(0,120));
+    return 'https://justpaste.it/'+alias;
+  }
+
+  if(pid==='zerobin'){
+    // 0bin.net — POST form with base64-encoded content, no login needed
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','0bin.net');
+    term.add('  Submitting paste to 0bin.net...','info');
+    const r=await fetch('https://0bin.net/paste',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:new URLSearchParams({content,expire_after:'never'}).toString()});
+    // 0bin redirects to the paste URL on success
+    if(r.url&&r.url.includes('/paste/')&&r.url!=='https://0bin.net/paste') return r.url;
+    const text=await r.text();
+    const m=text.match(/href=["'](\/paste\/[^"']+)["']/i);
+    if(m) return 'https://0bin.net'+m[1];
+    throw new Error('0bin.net: could not extract paste URL');
+  }
+
+  if(pid==='ghgist'){
+    // GitHub Gist — reuse existing GitHub account token
+    const ghAccount=S.accounts.find(a=>a.platform==='github');
+    if(!ghAccount) throw new Error('GitHub Gist: Connect a GitHub account first in Setup → GitHub Pages');
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,ghAccount.login,'gist.github.com');
+    const desc=(extraVal||'SEO guide')+' — '+kw;
+    term.add('  Creating public Gist as '+ghAccount.login+'...','info');
+    const r=await fetch('https://api.github.com/gists',{method:'POST',
+      headers:{'Authorization':'token '+ghAccount.token,'Content-Type':'application/json','Accept':'application/vnd.github+json'},
+      body:JSON.stringify({
+        description:desc,
+        public:true,
+        files:{[slug(kw)+'.md']:{content}}
+      })});
+    const d=await r.json();
+    if(!d.html_url) throw new Error('GitHub Gist: '+(d.message||JSON.stringify(d).slice(0,80)));
+    return d.html_url;
+  }
+
+  if(pid==='hackmd'){
+    // HackMD — POST JSON with API token, creates a public note
+    const apiToken=extraVal||account.extra||account.token||'';
+    if(!apiToken) throw new Error('HackMD: API token required — create one in HackMD Settings → API');
+    const content=generateMarkdown(kw,S.links,idx,S.keywords,'anon','hackmd.io');
+    term.add('  Creating HackMD note...','info');
+    const r=await fetch('https://api.hackmd.io/v1/notes',{method:'POST',
+      headers:{'Content-Type':'application/json','Accept':'application/json','Authorization':'Bearer '+apiToken},
+      body:JSON.stringify({
+        title:kw+' — Complete Guide '+year(),
+        content:content,
+        readPermission:'guest',
+        writePermission:'owner',
+        commentPermission:'everyone'
+      })});
+    const d=await r.json();
+    if(!d.publishLink&&!d.id) throw new Error('HackMD: '+(d.message||JSON.stringify(d).slice(0,100)));
+    return d.publishLink||'https://hackmd.io/'+d.id;
+  }
+
   // ── FORM-LOGIN PLATFORMS ───────────────────────────────────────
 
   if(pid==='techplanet'){
@@ -4291,6 +4511,33 @@ async function runSingleCampaign(pid, kw, account, extraVal, idx, term){
   }
 
   throw new Error('No handler for platform: '+pid);
+}
+
+// ─── AUTO-INDEXER (fires after each successful campaign URL) ──
+async function autoSubmitToIndexers(url, term){
+  const key=settingGet('li_indexNowKey')||settingGet('indexnow_key')||'';
+  const results=[];
+  // 1. IndexNow — instant push to Bing, Yandex, Seznam (free, no auth if key present)
+  if(key){
+    try{
+      const host=new URL(url).hostname;
+      const r=await fetch('https://api.indexnow.org/indexnow',{method:'POST',
+        headers:{'Content-Type':'application/json; charset=utf-8'},
+        body:JSON.stringify({host,key,keyLocation:'https://'+host+'/'+key+'.txt',urlList:[url]})});
+      results.push('IndexNow:'+(r.status===200||r.status===202?'✓':'✗ '+r.status));
+    }catch(e){ results.push('IndexNow:✗'); }
+  }
+  // 2. Google Ping (sitemap ping — crawl signal, free, no auth)
+  try{
+    await fetch('https://www.google.com/ping?sitemap='+encodeURIComponent(url),{method:'GET',mode:'no-cors'});
+    results.push('Google:✓');
+  }catch(e){ results.push('Google:✗'); }
+  // 3. Bing Webmaster Ping (free, no auth required for basic ping)
+  try{
+    await fetch('https://www.bing.com/ping?sitemap='+encodeURIComponent(url),{method:'GET',mode:'no-cors'});
+    results.push('Bing:✓');
+  }catch(e){ results.push('Bing:✗'); }
+  if(term) term.add('  📡 Auto-indexed: '+results.join(' | '),'info');
 }
 
 // ─── INDEXING ────────────────────────────────────────────────
@@ -4535,6 +4782,9 @@ async function runGlobalBlast(){
         const result={id:uid(),platform:pid,keyword:kw,repo:slug(prefix+'-'+kw),url,status:'success',ts:ts()};
         S.campaigns=S.campaigns.filter(c=>!(c.platform===pid&&c.keyword===kw));
         S.campaigns.push(result);
+        if(settingGet('auto_index_on_publish')&&url){
+          autoSubmitToIndexers(url,{add:(m,t)=>term.add('    '+m,t)}).catch(()=>{});
+        }
         urlsEl.innerHTML='<div class="card slide-in"><div class="card-title">🚀 Live URLs — '+liveUrls.length+' total</div>'+liveUrls.slice(-10).map(u=>urlBannerHTML(u.url,u.keyword,u.platform)).join('')+'</div>';
       }catch(e){
         term.add('  ✗ '+p.name+': '+e.message,'error');
@@ -13511,6 +13761,7 @@ const SETTINGS_DEFAULTS = {
   w2b_articleLength:     'medium',
   w2b_interlinkCount:    3,
   w2b_pingAfterBuild:    true,
+  auto_index_on_publish: true,
   w2b_indexAfterBuild:   true,
   w2b_delayBetween:      2000,
 
@@ -13836,6 +14087,7 @@ function renderSettings(el) {
     sField('w2b_interlinkCount','Internal Link Count','number',{min:1,max:10,unit:'links',hint:'Links to inject into each article'}) +
     sField('w2b_pingAfterBuild','Ping After Build','toggle',{hint:'Auto-ping Google/Bing after each successful post'}) +
     sField('w2b_indexAfterBuild','Index After Build','toggle',{hint:'Auto-submit to IndexNow after each post'}) +
+    sField('auto_index_on_publish','Auto-Index Paste URLs','toggle',{hint:'Instantly fires IndexNow + Google/Bing ping after every successful paste campaign URL — runs silently in background'}) +
     sField('w2b_delayBetween','Delay Between Builds','number',{min:500,max:15000,step:500,unit:'ms'})
   )}
 
